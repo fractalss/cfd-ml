@@ -1,0 +1,96 @@
+Metadata-Version: 2.4
+Name: cpfd_rom
+Version: 0.1
+Summary: A CLI tool to run reduced-order models from CFD datasets
+Author: Saurav Mitra
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scikit-learn
+Requires-Dist: tensorflow
+Requires-Dist: matplotlib
+Requires-Dist: pyyaml
+Requires-Dist: absl-py
+Dynamic: author
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: summary
+
+# ROM Pipeline CLI
+
+This project provides a command-line interface (CLI) to run Reduced Order Model (ROM) pipelines using machine learning or PCA-RBF-based techniques on Eulerian or Lagrangian CFD simulation data.
+
+## Installation
+
+To install this project as a CLI tool:
+
+```bash
+pip install -e .
+```
+
+This will register the CLI command `rom-cli`.
+
+## Usage
+
+```bash
+rom-cli --config_yaml path/to/rom_inputs.yaml
+```
+
+## YAML Configuration
+
+A sample `rom_inputs.yaml` file should define the following:
+
+```yaml
+rom_type: ML  # or PCA-RBF
+type_of_field: Eulerian  # or Lagrangian
+field_variable: Particle volume fraction
+user_velocity: 11
+target_times:
+  - 5.0
+  - 10.0
+  - 15.0
+
+base_data_dir: /path/to/data
+rev_dirs: ["Rev1", "Rev2", "Rev3"]
+vel_mapping:
+  Rev1: 10
+  Rev2: 12
+  Rev3: 14
+test_dir: Test_1
+
+skip_training: true
+```
+
+## Output
+
+Model results, visualizations (e.g., RMSE plots, snapshot comparisons), and model files will be saved to subdirectories under `rom_output/` and `model_files/` inside `base_data_dir`.
+
+## Project Structure
+
+```
+CPFD-ROM/
++-- rom_cli.py              # Entry point CLI
++-- ml_rom/                 # ML-based ROMs
++-- pca_rbf_rom/            # PCA-RBF ROMs
++-- util/
+¦   +-- config.py
+¦   +-- io_utils.py
+¦   +-- lagrangian_io.py
+¦   +-- output_utils.py
+¦   +-- model_utils.py
++-- setup.py                # CLI and pip installation setup
++-- rom_inputs.yaml         # Sample configuration
+```
+
+## Development
+
+To run locally during development:
+
+```bash
+python rom_cli.py --config_yaml rom_inputs.yaml
+```
+
+## License
+
+MIT License
