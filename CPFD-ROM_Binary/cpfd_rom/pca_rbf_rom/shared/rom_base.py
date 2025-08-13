@@ -27,8 +27,6 @@ class PCARBF_ROM_Generic:
         self.X_pca_train = X_pca
         self.parameters_train = parameters
 
-        print(f"[DEBUG] PCA fit completed. Shape of X_pca: {X_pca.shape}")
-        print(f"[DEBUG] First few PCA coefficients:\n{X_pca[:5]}")
 
         self.scaler = StandardScaler().fit(X_pca)
         X_pca_scaled = self.scaler.transform(X_pca)
