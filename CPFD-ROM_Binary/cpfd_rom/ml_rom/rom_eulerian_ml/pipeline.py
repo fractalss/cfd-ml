@@ -1,200 +1,197 @@
 # GCN-based Eulerian ROM pipeline (PyTorch + PyG)
-# Refactored to use canonical nodes/edges from graph_build.ensure_graph_artifacts
-# so node order, connectivity, and feature alignment are consistent.
+# Graph-first flow:
+#  - Build ONE canonical graph from a reference training directory (first of rev_dirs)
+#  - Assemble training targets from ALL rev_dirs with their parameter values
+#  - Train GCN on [XYZ(+time)+param] -> field
+#  - Inference for user_parameter using the same canonical graph & the reference times
 
 from __future__ import annotations
+
 import os
-from typing import Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 
-from cpfd_rom.util import config
 from cpfd_rom.util.model_utils import setup_model_paths
-from cpfd_rom.util.output_utils import setup_output_dir
-from cpfd_rom.ml_rom.rom_eulerian_ml.loader import load_and_preprocess_eulerian_data_npy
-from cpfd_rom.ml_rom.rom_eulerian_ml.evaluation import compute_rmse
+from cpfd_rom.util.output_utils import setup_output_dir, format_metadata
 from cpfd_rom.ml_rom.rom_eulerian_ml import graph_build
-from cpfd_rom.ml_rom.rom_eulerian_ml.model_gnn import train_gcn_model, build_gcn_model
+from cpfd_rom.ml_rom.rom_eulerian_ml.model_gnn import (
+    train_gcn_model,
+    build_gcn_model,
+    build_node_features_xyz,
+)
+from cpfd_rom.ml_rom.rom_eulerian_ml.inference import infer_on_param
 
-
-# -------------------------------------------------------------------------
-# Utilities
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
 def _torch_model_path(base_path: str) -> str:
-    """Force .keras ? .pt for checkpoints."""
     if base_path.endswith(".keras"):
         return base_path[:-6] + ".pt"
     if not base_path.endswith(".pt"):
         return base_path + ".pt"
     return base_path
 
-def _normalize_SNx(X: np.ndarray) -> np.ndarray:
-    """Coerce to (S,N) from (S,N,1) or (S,1,N)."""
-    X = np.asarray(X)
-    if X.ndim == 3 and X.shape[-1] == 1:
-        return X[..., 0]
-    if X.ndim == 3 and X.shape[1] == 1:
-        return X[:, 0, :]
-    if X.ndim == 2:
-        return X
-    raise ValueError(f"Bad shape: {X.shape}")
 
-def _get_device(name: str | None = None) -> torch.device:
-    if name in {"cpu", "cuda"}:
-        return torch.device(name if (name != "cuda" or torch.cuda.is_available()) else "cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _list_targets(graph_dir: Path) -> List[Tuple[float, Path]]:
+    snap_dir = graph_dir / 'snapshots'
+    files = sorted(list(snap_dir.glob('target_*.parquet')) + list(snap_dir.glob('target_*.csv')))
+    if not files:
+        raise FileNotFoundError(f"No target_* files found in {snap_dir}")
+    import re
+    rx = re.compile(r'target_(\d+\.?\d*)s\.(?:parquet|csv)')
+    times = [(float(m.group(1)), p) for p in files if (m := rx.match(p.name))]
+    return sorted(times, key=lambda t: t[0])
 
-def _predict_with_gcn(model, X_scaled, param_value, edge_index, device=None) -> np.ndarray:
-    """Snapshot-wise inference to bound memory usage."""
-    dev = _get_device(device)
-    if isinstance(edge_index, np.ndarray):
-        ei = torch.from_numpy(edge_index).long().to(dev)
-    else:
-        ei = edge_index.to(dev)
 
-    X = _normalize_SNx(X_scaled)
-    S, N = X.shape
-    out_list = []
-    P_pred = np.full((S, 1), float(param_value), dtype=np.float32)
-    model.eval()
-    with torch.no_grad():
-        for s in range(S):
-            x_node = torch.from_numpy(X[s].astype(np.float32)).to(dev).reshape(-1, 1)
-            p_node = torch.from_numpy(P_pred[s]).to(dev).reshape(1, -1).repeat(N, 1)
-            feats = torch.cat([x_node, p_node], dim=1)
-            y = model(feats, ei).squeeze(-1).detach().cpu().numpy()
-            out_list.append(y)
-    return np.stack(out_list, axis=0)
+def _load_target_vec(path: Path) -> np.ndarray:
+    df = pd.read_parquet(path) if path.suffix == '.parquet' else pd.read_csv(path)
+    arr = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+    arr = arr if arr.ndim > 1 else arr.reshape(-1, 1)
+    return arr.reshape(-1)
 
-def align_and_evaluate_ml_rom(X_pred, pivoted_columns, times, config, scaler):
-    """Align ROM vs CFD and compute RMSE."""
-    test_data = config.test_df.dropna(subset=[config.field_variable])
-    pivoted_test = test_data.pivot_table(index="time", columns=["x", "y", "z"], values=config.field_variable)
 
-    X_pred = np.squeeze(X_pred)
-    pred_df_all = pd.DataFrame(X_pred, index=times, columns=list(pivoted_columns)[: X_pred.shape[1]])
+def _assemble_train_val_from_revs(cfg: Dict, neighbor_set: str = 'n6', val_frac: float = 0.2):
+    """Build canonical graph from the FIRST rev in cfg['rev_dirs'].
+    Generate snapshot targets for ALL revs, then assemble Y_train/Y_val and P arrays.
+    Returns: (nodes_df, edge_index, X_node, Y_train, Y_val, P_train, P_val, times_train, times_val)
+    """
+    base = Path(cfg['base_data_dir'])
+    out_root = Path(cfg['output_dir']) / 'graph'
 
-    common_cols = [col for col in pivoted_columns if col in pivoted_test.columns]
-    common_times = sorted(set(pivoted_test.index) & set(pred_df_all.index))
-    if not common_times:
-        raise ValueError("No common times between CFD and ROM predictions!")
+    # 1) Pick reference rev for canonical graph (node order, ijk mapping)
+    revs: List[str] = list(cfg['rev_dirs'])
+    if not revs:
+        raise ValueError("cfg['rev_dirs'] must list training directories")
+    ref_rev = revs[0]
 
-    pred_df_all = pred_df_all.loc[common_times, common_cols]
-    pivoted_test = pivoted_test.loc[common_times, common_cols]
-
-    cfd_values, rom_values = pivoted_test.values, pred_df_all.values
-    assert cfd_values.shape == rom_values.shape, f"Mismatch: CFD {cfd_values.shape}, ROM {rom_values.shape}"
-
-    rmse_df, merged_snapshots = compute_rmse(
-        cfd_values, rom_values, common_times,
-        config.target_times,
-        pd.MultiIndex.from_tuples(common_cols, names=["x", "y", "z"]),
-        scaler,
+    # Ensure artifacts for the reference rev (nodes/edges + targets)
+    ref_graph_dir = graph_build.ensure_graph_artifacts(
+        {**cfg, 'test_dir': ref_rev}, cfg['field_variable'], rebuild=False, neighbor_set=neighbor_set
     )
-    return rmse_df, merged_snapshots
+
+    # 2) Ensure targets for every other rev (nodes/edges are taken only from ref_rev)
+    for r in revs[1:]:
+        graph_build.ensure_graph_artifacts({**cfg, 'test_dir': r}, cfg['field_variable'], rebuild=False, neighbor_set=neighbor_set)
+
+    # Load canonical nodes & edges from ref_rev
+    nodes_df = pd.read_parquet(ref_graph_dir / 'nodes.parquet').sort_values('node_id').reset_index(drop=True)
+    edge_index = graph_build.build_edge_index(nodes_df[['i','j','k']], neighbor_set=neighbor_set, bidirectional=True)
+    graph_build.summarize_connectivity(nodes_df, edge_index, neighbor_set=neighbor_set)
+
+    # Build static node features (standardized xyz) to match inference.py
+    X_node = build_node_features_xyz(nodes_df)
+
+    # 3) Assemble datasets
+    Y_train_list: List[np.ndarray] = []
+    Y_val_list:   List[np.ndarray] = []
+    P_train_list: List[np.ndarray] = []
+    P_val_list:   List[np.ndarray] = []
+    T_train_list: List[float] = []
+    T_val_list:   List[float] = []
+
+    for r in revs:
+        graph_dir = out_root / r
+        targets = _list_targets(graph_dir)
+        times = np.array([t for t, _ in targets], dtype=float)
+        n = len(targets)
+        n_train = max(1, int((1.0 - val_frac) * n))
+
+        # Parameter value for this rev
+        pval = float(cfg['param_mapping'][r])
+        P_row = np.array([pval], dtype=np.float32)
+
+        # Load to arrays in node_id order
+        Ys = np.stack([_load_target_vec(p) for _, p in targets], axis=0)  # (S, N)
+
+        Y_train_list.append(Ys[:n_train])
+        Y_val_list.append(Ys[n_train:])
+        P_train_list.append(np.repeat(P_row[None, :], n_train, axis=0))
+        P_val_list.append(np.repeat(P_row[None, :], n - n_train, axis=0))
+        T_train_list.extend(times[:n_train].tolist())
+        T_val_list.extend(times[n_train:].tolist())
+
+    Y_train = np.concatenate(Y_train_list, axis=0) if Y_train_list else np.empty((0, len(nodes_df)), dtype=np.float32)
+    Y_val   = np.concatenate(Y_val_list,   axis=0) if Y_val_list   else np.empty((0, len(nodes_df)), dtype=np.float32)
+    P_train = np.concatenate(P_train_list, axis=0) if P_train_list else np.empty((0, 1), dtype=np.float32)
+    P_val   = np.concatenate(P_val_list,   axis=0) if P_val_list   else np.empty((0, 1), dtype=np.float32)
+    times_train = np.array(T_train_list, dtype=float) if T_train_list else None
+    times_val   = np.array(T_val_list,   dtype=float) if T_val_list   else None
+
+    return ref_rev, nodes_df, edge_index, X_node, Y_train, Y_val, P_train, P_val, times_train, times_val
 
 
-# -------------------------------------------------------------------------
-# Main pipeline
-# -------------------------------------------------------------------------
+def _write_rom_only(preds: np.ndarray, times: np.ndarray, nodes_df: pd.DataFrame, field_name: str, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    header_cols = ['x','y','z','i','j','k', field_name]
+    header_md = [format_metadata(i+1, c) for i, c in enumerate(header_cols)]
+    key = nodes_df[['node_id','x','y','z','i','j','k']].sort_values('node_id').reset_index(drop=True)
 
-def run_ml_rom_pipeline(config, log_time):
-    # I/O setup
-    setup_output_dir(config)
-    setup_model_paths(config)
-    model_path_pt = _torch_model_path(config.model_path_eulerian)
+    for s, t in enumerate(times):
+        y = preds[s].astype(np.float64)
+        df = key.copy(); df[field_name] = y
+        df = df.sort_values(by=['k','j','i'], kind='mergesort')
+        out_path = out_dir / f"cells_{float(t):09.3f}s.txt"
+        with open(out_path, 'w') as f:
+            f.write('# Zone name = "Cells"\n')
+            f.write(f'# Solution time = {float(t):.6f} s\n')
+            for line in header_md:
+                f.write(line)
+            df[['x','y','z','i','j','k', field_name]].to_csv(
+                f, sep='\t', header=False, index=False, float_format='%.6e')
 
-    # Load Eulerian data
-    with log_time("Loading and preprocessing Eulerian data for ML"):
-        X_train, X_test, P_train, P_test, scaler, pivoted_columns = load_and_preprocess_eulerian_data_npy()
+# -----------------------------------------------------------------------------
+# Main pipeline entry
+# -----------------------------------------------------------------------------
 
-    X_train, X_test = _normalize_SNx(X_train), _normalize_SNx(X_test)
-    P_train = P_train[:, None] if P_train.ndim == 1 else P_train
-    P_test = P_test[:, None] if P_test.ndim == 1 else P_test
+def run_ml_rom_pipeline(cfg, log_time):
+    # Basic setup
+    setup_output_dir(cfg)
+    setup_model_paths(cfg)
+    model_path_pt = _torch_model_path(cfg.model_path_eulerian)
 
-    # Ensure canonical graph artifacts exist
-    with log_time("Ensuring graph artifacts (nodes, edges, targets)"):
-        graph_dir = graph_build.ensure_graph_artifacts(config.__dict__, config.field_variable, rebuild=False)
-        nodes_df = pd.read_parquet(graph_dir / "nodes.parquet")
-        # Build edges from integer (i,j,k)
-        edge_index = graph_build.build_edge_index(
-            nodes_df[["i", "j", "k"]],
-            neighbor_set="n6",
-            bidirectional=True
-        )
+    # Build canonical graph from FIRST rev, assemble datasets from ALL revs
+    with log_time("Preparing graph & datasets from rev_dirs"):
+        (ref_rev, nodes_df, edge_index, X_node,
+         Y_train, Y_val, P_train, P_val, times_train, times_val) = _assemble_train_val_from_revs(cfg.__dict__, neighbor_set='n6')
 
-        # Connectivity summary
-        graph_build.summarize_connectivity(nodes_df, edge_index, neighbor_set="n6")
-
-        # --- Add this undirected dedup check here ---
-        u, v = edge_index[0], edge_index[1]
-        uv = np.stack([np.minimum(u, v), np.maximum(u, v)], axis=1)  # canonical undirected pairs
-        uniq = np.unique(uv, axis=0)
-        E_undir = uniq.shape[0]
-
-
-        print(f"[GRAPH] Undirected unique edges: {E_undir} (expected - 6*N minus boundaries)")
-        # ----------
-
-        # Align features to node order
-        graph_build.assert_feature_alignment(X_train.shape[1], edge_index)
-
-    # Train or load model
-    if getattr(config, "skip_training", False) and os.path.exists(model_path_pt):
+    # Train or load
+    if getattr(cfg, 'skip_training', False) and os.path.exists(model_path_pt):
         with log_time("Loading pretrained GCN model"):
-            in_dim = 1 + (P_train.shape[1] if P_train is not None else 1)
-            model = build_gcn_model(in_dim=in_dim, hidden=getattr(config, "hidden", 64), out_dim=1, dropout=getattr(config, "dropout", 0.1))
-            state = torch.load(model_path_pt, map_location=("cuda" if torch.cuda.is_available() else "cpu"))
+            in_dim = X_node.shape[1] + P_train.shape[1]  # no time features by default
+            model = build_gcn_model(in_dim=in_dim, hidden=getattr(cfg, 'hidden', 64), out_dim=1, dropout=getattr(cfg, 'dropout', 0.1))
+            state = torch.load(model_path_pt, map_location=('cuda' if torch.cuda.is_available() else 'cpu'))
             model.load_state_dict(state)
-            try:
-                scaler = joblib.load(model_path_pt.replace(".pt", "_scaler.pkl"))
-            except Exception:
-                pass
     else:
-        with log_time("Training GCN-based Eulerian ROM"):
-            model, _ = train_gcn_model(
-                X_train, X_test, P_train, P_test, edge_index,
-                epochs=getattr(config, "epochs", 2),
-                lr=getattr(config, "lr", 1e-3),
-                hidden=getattr(config, "hidden", 64),
-                dropout=getattr(config, "dropout", 0.1),
-                lambda_smooth=getattr(config, "lambda_smooth", 0.1),
+        with log_time("Training GCN (graph-first)"):
+            model, hist = train_gcn_model(
+                Y_train, Y_val, P_train, P_val, edge_index,
+                X_node=X_node,
+                epochs=getattr(cfg, 'epochs', 50),
+                lr=getattr(cfg, 'lr', 1e-3),
+                hidden=getattr(cfg, 'hidden', 64),
+                dropout=getattr(cfg, 'dropout', 0.1),
+                lambda_smooth=getattr(cfg, 'lambda_smooth', 0.0),
                 add_time=False,
+                times_train=times_train,
+                times_test=times_val,
             )
             torch.save(model.state_dict(), model_path_pt)
-            joblib.dump(scaler, model_path_pt.replace(".pt", "_scaler.pkl"))
 
-    # Zero-shot inference on full sequence
-    # --- In pipeline.py, replace the "Zero-shot inference (full sequence)" block with: ---
-    with log_time("Zero-shot inference (test_dir only)"):
-        # Use ONLY the test split for inference/eval so shapes match CFD
-        X_scaled = _normalize_SNx(X_test)
-        times = np.asarray(getattr(config, "test_times", np.arange(X_scaled.shape[0], dtype=float)))
+    # Inference for the requested user_parameter, using the canonical graph & reference times
+    with log_time("Inference at user_parameter (ROM-only outputs)"):
+        # Build an inference cfg that points test_dir to the canonical ref_rev graph/times
+        icfg = dict(cfg.__dict__)
+        icfg['test_dir'] = ref_rev  # reuse reference times & graph
+        preds, times, nodes_df_inf = infer_on_param(model, icfg, param_value=cfg.user_parameter, device='auto')
 
-        # Build a light test_df for eval/plots aligned to test_dir only
-        X_raw = scaler.inverse_transform(X_scaled)
-        test_records = (
-            {
-                "source": config.test_dir,
-                "time": float(t),
-                "x": x,
-                "y": y,
-                "z": z,
-                config.field_variable: val,
-            }
-            for t, snapshot in zip(times, X_raw)
-            for (x, y, z), val in zip(pivoted_columns, snapshot)
-        )
-        config.test_df = pd.DataFrame.from_records(test_records)
+        # Write ROM-only files (x y z i j k + field)
+        out_dir = Path(cfg.output_dir) / 'ML' / f'ROM_param_{float(cfg.user_parameter):.3f}'
+        _write_rom_only(preds, times, nodes_df_inf, cfg.field_variable, out_dir)
 
-        # Predict with the trained GCN on test only
-        X_pred = _predict_with_gcn(model, X_scaled, param_value=config.user_parameter, edge_index=edge_index)
-
-    # Evaluation
-    with log_time("Evaluating ML-ROM output"):
-        rmse_df, merged_snapshots = align_and_evaluate_ml_rom(X_pred, pivoted_columns, times, config, scaler)
-
-    return rmse_df, merged_snapshots
+    return None, None
