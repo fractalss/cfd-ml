@@ -8,7 +8,7 @@ import yaml
 import os
 import sys
 import gc
-import tensorflow as tf
+# import tensorflow as tf
 
 from cpfd_rom.util import config
 from cpfd_rom.util.io_utils import process_directory_npy
@@ -26,7 +26,7 @@ def log_time(task_name):
     print(f"[Timing] {task_name} took {end - start:.2f} seconds")
 
 def clear_memory():
-    tf.keras.backend.clear_session()
+    # tf.keras.backend.clear_session()
     gc.collect()
 
 def load_config_from_yaml(yaml_path):

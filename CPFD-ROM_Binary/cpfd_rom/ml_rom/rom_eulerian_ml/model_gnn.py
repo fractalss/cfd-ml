@@ -1,134 +1,252 @@
-# Modified model.py with parameter injection in latent space (concatenation logic)
-import tensorflow as tf
+# model_gnn.py
+from __future__ import annotations
+import math
 import numpy as np
-from tensorflow.keras import models, layers, callbacks
+from pathlib import Path
+from typing import Dict, Tuple, Optional
 
-# Enable XLA acceleration
-tf.config.optimizer.set_jit(True)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import to_undirected
 
 # ---------------------------------
 # Model
 # ---------------------------------
 
 class ThreeLayerGCN(nn.Module):
-    def __init__(self, in_dim, hidden=64, out_dim=1, dropout=0.1):
+    def __init__(self, in_dim: int, hidden: int = 64, out_dim: int = 1, dropout: float = 0.1):
         super().__init__()
         self.conv1 = GCNConv(in_dim, hidden, cached=True)
         self.conv2 = GCNConv(hidden, hidden, cached=True)
         self.conv3 = GCNConv(hidden, out_dim, cached=True)
         self.dropout = dropout
-    def forward(self, x, edge_index):
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        # x: (N, F)  edge_index: (2, E)
         x = F.relu(self.conv1(x, edge_index))
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = F.relu(self.conv2(x, edge_index))
         x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.conv3(x, edge_index)
+        x = self.conv3(x, edge_index)  # (N, 1)
         return x
 
+
+def build_gcn_model(in_dim: int, hidden: int = 64, out_dim: int = 1, dropout: float = 0.1) -> nn.Module:
+    """Small helper to construct the GCN with a clean signature."""
+    return ThreeLayerGCN(in_dim=in_dim, hidden=hidden, out_dim=out_dim, dropout=dropout)
+
 # ---------------------------------
-# Training / Eval / Write
+# (Optional) Time features
 # ---------------------------------
 
-def _load_target_vec(path: Path) -> torch.Tensor:
-    df = pd.read_parquet(path) if path.suffix == '.parquet' else pd.read_csv(path)
-    arr = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
-    return torch.tensor(arr if arr.ndim>1 else arr.reshape(-1,1), dtype=torch.float32)
+def _time_feature_dim(mode: str, m: int) -> int:
+    if mode == 'none':
+        return 0
+    if mode == 'scalar':
+        return 1
+    if mode == 'fourier':
+        return 2 * max(1, int(m))
+    raise ValueError(f"Unknown time feature mode: {mode}")
 
+def _time_block_for(t: float, N: int, device, dtype, mode: str, t_min: float, t_max: float, mu: float, sigma: float, m: int):
+    if mode == 'none':
+        return None
+    if mode == 'scalar':
+        # z-score with snapshot-time stats if provided
+        sigma = sigma if sigma and sigma > 0 else 1.0
+        t_norm = (t - (mu if mu is not None else 0.0)) / sigma
+        return torch.full((N, 1), float(t_norm), device=device, dtype=dtype)
+    if mode == 'fourier':
+        if t_max == t_min:
+            t_max = t_min + 1.0
+        t01 = (t - t_min) / (t_max - t_min)
+        freqs = torch.tensor([2**k for k in range(max(1, int(m)))], device=device, dtype=dtype)
+        ang = 2.0 * math.pi * t01 * freqs
+        s = torch.sin(ang)
+        c = torch.cos(ang)
+        vec = torch.cat([s, c], dim=-1)  # (2m,)
+        return vec.unsqueeze(0).repeat(N, 1)
+    raise ValueError(f"Unknown time feature mode: {mode}")
 
-def _list_targets(graph_dir: Path):
-    snap_dir = graph_dir / 'snapshots'
-    files = sorted(list(snap_dir.glob('target_*.parquet')) + list(snap_dir.glob('target_*.csv')))
-    if not files:
-        raise FileNotFoundError(f"No target_* files found in {snap_dir}")
-    rx = re.compile(r'target_(\d+\.?\d*)s\.(?:parquet|csv)')
-    times = [(float(m.group(1)), p) for p in files if (m := rx.match(p.name))]
-    return sorted(times, key=lambda t: t[0])
+# ---------------------------------
+# Training (array-first, single fixed graph)
+# ---------------------------------
 
+def _broadcast_params(params_row: np.ndarray, N: int, device, dtype) -> torch.Tensor:
+    """
+    params_row: (param_dim,) numpy
+    Returns: (N, param_dim) tensor broadcast across nodes
+    """
+    if params_row.ndim != 1:
+        params_row = params_row.reshape(-1)
+    pr = torch.from_numpy(params_row.astype(np.float32)).to(device)
+    return pr.unsqueeze(0).repeat(N, 1).to(dtype)
+
+def _make_features(x_snap: np.ndarray,
+                   params_row: np.ndarray,
+                   N: int,
+                   device,
+                   *,
+                   add_time: bool = False,
+                   time_val: Optional[float] = None,
+                   time_mode: str = 'none',
+                   t_min: float = 0.0,
+                   t_max: float = 1.0,
+                   t_mu: Optional[float] = None,
+                   t_sigma: Optional[float] = None,
+                   fourier_m: int = 4) -> torch.Tensor:
+    """
+    Build per-node features by concatenating:
+    [ field_value (N,1) | broadcast(params) (N,P) | (optional) time block (N,T) ]
+    """
+    x_node = torch.from_numpy(x_snap.astype(np.float32)).to(device).reshape(-1, 1)  # (N,1)
+    P_node = _broadcast_params(params_row, N, device, x_node.dtype)                 # (N,P)
+
+    feats = [x_node, P_node]
+    if add_time and time_mode != 'none' and time_val is not None:
+        tb = _time_block_for(time_val, N, device, x_node.dtype, time_mode, t_min, t_max, t_mu, t_sigma, fourier_m)
+        feats.append(tb)
+
+    return torch.cat(feats, dim=1)  # (N, 1+P+T)
 
 def laplacian_smoothness(pred: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    # pred: (N, 1)
     src, dst = edge_index
     diff = pred[src] - pred[dst]
-    return (diff**2).mean()
+    return (diff ** 2).mean()
 
+@torch.no_grad()
+def _eval_set(model: nn.Module,
+              X: np.ndarray,
+              P: np.ndarray,
+              edge_index: torch.Tensor,
+              device,
+              *,
+              add_time: bool = False,
+              times: Optional[np.ndarray] = None,
+              time_mode: str = 'none',
+              t_min: float = 0.0,
+              t_max: float = 1.0,
+              t_mu: Optional[float] = None,
+              t_sigma: Optional[float] = None,
+              fourier_m: int = 4) -> float:
+    model.eval()
+    loss_fn = nn.MSELoss()
+    N = X.shape[1]
+    losses = []
+    for s in range(X.shape[0]):
+        feats = _make_features(
+            X[s], P[s], N, device,
+            add_time=add_time,
+            time_val=(times[s] if (add_time and times is not None) else None),
+            time_mode=time_mode, t_min=t_min, t_max=t_max, t_mu=t_mu, t_sigma=t_sigma, fourier_m=fourier_m
+        )
+        y_true = torch.from_numpy(X[s].astype(np.float32)).to(device).reshape(-1, 1)
+        y_pred = model(feats, edge_index)
+        losses.append(loss_fn(y_pred, y_true).item())
+    return float(np.mean(losses)) if losses else float("nan")
 
-def train_and_validate(model, edge_index, x, target_paths, device,
-                       epochs=50, lr=1e-3, png_path: Path | None = None,
-                       live_plotter: LivePlotter | None = None,
-                       time_mode: str = 'none', fourier_m: int = 4, lambda_smooth: float = 0.0):
-    model.to(device); x = x.to(device); edge_index = edge_index.to(device)
-    n = len(target_paths); n_train = max(1, int(0.8*n))
+def train_gcn_model(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    P_train: np.ndarray,
+    P_test: np.ndarray,
+    edge_index: np.ndarray | torch.Tensor,
+    *,
+    epochs: int = 50,
+    lr: float = 1e-3,
+    hidden: int = 64,
+    dropout: float = 0.1,
+    lambda_smooth: float = 0.0,
+    device: Optional[str] = None,
+    # Optional time conditioning (disabled by default)
+    add_time: bool = False,
+    times_train: Optional[np.ndarray] = None,
+    times_test: Optional[np.ndarray] = None,
+    time_mode: str = 'none',
+    fourier_m: int = 4,
+) -> Tuple[nn.Module, Dict[str, list]]:
+    """
+    Array-first training API for a single fixed graph.
+    - X_*: (num_snapshots, N)        scalar field per node
+    - P_*: (num_snapshots, param_dim) global snapshot params
+    - edge_index: (2, E) np.ndarray or torch.LongTensor
+    Returns: (model, history_dict)
+    """
+    assert X_train.ndim == 2 and X_test.ndim == 2, "X_* must be (S, N)"
+    assert P_train.ndim == 2 and P_test.ndim == 2, "P_* must be (S, param_dim)"
+    assert X_train.shape[0] == P_train.shape[0] and X_test.shape[0] == P_test.shape[0], "Snapshot count mismatch"
 
-    print(f"[NORM] Computing target normalization from first {n_train} snapshots")
-    sum_, sumsq, count = 0.0, 0.0, 0
-    for i in tqdm(range(n_train), desc="Loading train targets", leave=False):
-        y = _load_target_vec(target_paths[i][1])
-        sum_ += float(y.sum().item())
-        sumsq += float((y**2).sum().item())
-        count += int(y.numel())
-        del y
-    y_mu = (sum_ / max(1, count))
-    var = max((sumsq / max(1, count)) - y_mu * y_mu, 0.0)
-    y_sigma = math.sqrt(var) if var > 0 else 1.0
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
 
-    # Time stats for Option A
-    t_stats = _compute_time_stats(target_paths, n_train)
+    # Edge index tensor
+    if isinstance(edge_index, np.ndarray):
+        ei = torch.from_numpy(edge_index).long().to(dev)
+    else:
+        ei = edge_index.to(dev)
+    # Ensure undirected for GCNConv
+    ei = to_undirected(ei)
 
+    N = X_train.shape[1]
+    param_dim = P_train.shape[1]
+    t_feat_dim = _time_feature_dim(time_mode, fourier_m) if add_time else 0
+    in_dim = 1 + param_dim + t_feat_dim
+
+    model = build_gcn_model(in_dim=in_dim, hidden=hidden, out_dim=1, dropout=dropout).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
-    train_hist = []
-    train_eval_hist = []
-    val_hist = []
+    # Optional time stats for scalar normalization / fourier
+    if add_time and times_train is not None and len(times_train) == X_train.shape[0]:
+        t_mu = float(np.mean(times_train))
+        t_sigma = float(np.std(times_train)) if np.std(times_train) > 0 else 1.0
+        t_min = float(np.min(times_train))
+        t_max = float(np.max(times_train)) if float(np.max(times_train)) > t_min else (t_min + 1.0)
+    else:
+        t_mu = t_sigma = None
+        t_min, t_max = 0.0, 1.0
 
-    for epoch in range(1, epochs+1):
-        model.train(); epoch_loss = 0.0
-        train_bar = tqdm(torch.randperm(n_train).tolist(), desc=f"Epoch {epoch:03d}/{epochs} [train]", leave=False)
-        for i in train_bar:
-            t_i, p = target_paths[i]
-            y = (_load_target_vec(p).to(device) - y_mu) / y_sigma
+    hist = {"train_mse": [], "val_mse": [], "val_rmse": []}
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        order = np.random.permutation(X_train.shape[0])
+        epoch_loss = 0.0
+
+        for s in order:
+            feats = _make_features(
+                X_train[s], P_train[s], N, dev,
+                add_time=add_time,
+                time_val=(times_train[s] if (add_time and times_train is not None) else None),
+                time_mode=time_mode, t_min=t_min, t_max=t_max, t_mu=t_mu, t_sigma=t_sigma, fourier_m=fourier_m
+            )
+            y_true = torch.from_numpy(X_train[s].astype(np.float32)).to(dev).reshape(-1, 1)
+
             opt.zero_grad(set_to_none=True)
-            x_t = _concat_time(x, float(t_i), device, time_mode, t_stats, fourier_m)
-            pred = model(x_t, edge_index)
-            mse = loss_fn(pred, y)
-            reg = lambda_smooth * laplacian_smoothness(pred, edge_index) if lambda_smooth > 0 else 0.0
-            loss = mse + (reg if isinstance(reg, torch.Tensor) else torch.tensor(reg, device=device, dtype=pred.dtype))
-            loss.backward(); opt.step()
+            y_pred = model(feats, ei)
+            mse = loss_fn(y_pred, y_true)
+            reg = laplacian_smoothness(y_pred, ei) * lambda_smooth if lambda_smooth > 0 else 0.0
+            loss = mse + (reg if isinstance(reg, torch.Tensor) else torch.tensor(reg, device=dev, dtype=y_pred.dtype))
+            loss.backward()
+            opt.step()
             epoch_loss += mse.item()
-            train_bar.set_postfix(mse=f"{mse.item():.3e}", reg=(f"{reg.item():.2e}" if isinstance(reg, torch.Tensor) else f"{reg:.2e}"))
-            del y, pred, mse
-        train_mse_n = epoch_loss / max(1, n_train)
 
-        # Option D: Train metric in eval() (dropout off)
-        model.eval()
-        with torch.no_grad():
-            te_losses = []
-            for i in range(n_train):
-                t_i, p = target_paths[i]
-                y = (_load_target_vec(p).to(device) - y_mu) / y_sigma
-                x_t = _concat_time(x, float(t_i), device, time_mode, t_stats, fourier_m)
-                pred = model(x_t, edge_index)
-                te_losses.append(loss_fn(pred, y).item())
-            train_eval_mse_n = float(np.mean(te_losses)) if te_losses else float('nan')
+        train_mse = epoch_loss / max(1, X_train.shape[0])
+        val_mse = _eval_set(
+            model, X_test, P_test, ei, dev,
+            add_time=add_time, times=times_test, time_mode=time_mode,
+            t_min=t_min, t_max=t_max, t_mu=t_mu, t_sigma=t_sigma, fourier_m=fourier_m
+        )
+        val_rmse = math.sqrt(val_mse) if val_mse == val_mse else float("nan")  # guard NaN
 
-        val_losses = []
-        if n_train < n:
-            val_bar = tqdm(range(n_train, n), desc=f"Epoch {epoch:03d}/{epochs} [val]", leave=False)
-            with torch.no_grad():
-                for j in val_bar:
-                    t_j, p = target_paths[j]
-                    y = (_load_target_vec(p).to(device) - y_mu) / y_sigma
-                    x_t = _concat_time(x, float(t_j), device, time_mode, t_stats, fourier_m)
-                    pred = model(x_t, edge_index)
-                    l = loss_fn(pred, y).item()
-                    val_losses.append(l)
-                    val_bar.set_postfix(mse_n=f"{l:.3e}")
-                    del y, pred
-        val_mse_n = float(np.mean(val_losses)) if val_losses else float('nan')
-        val_rmse = (math.sqrt(val_mse_n) * y_sigma) if val_losses else float('nan')
+        hist["train_mse"].append(train_mse)
+        hist["val_mse"].append(val_mse)
+        hist["val_rmse"].append(val_rmse)
 
-        train_hist.append(train_mse_n)
-        train_eval_hist.append(train_eval_mse_n)
-        val_hist.append(val_mse_n)
+        print(f"[EPOCH {epoch:03d}] train_MSE={train_mse:.6e}  val_MSE={val_mse:.6e}  val_RMSE={val_rmse:.6e}")
 
-        print(f"[EPOCH {epoch:03d}] train_MSE_n={train_mse_n:.6e}  train_eval_MSE_n={train_eval_mse_n:.6e}  val_MSE_n={val_mse_n:.6e}  val_RMSE_phys={val_rmse:.6e}")
-
+    return model, hist

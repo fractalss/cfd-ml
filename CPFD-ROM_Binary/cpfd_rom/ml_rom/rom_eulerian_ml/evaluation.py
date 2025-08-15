@@ -1,92 +1,134 @@
 import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import root_mean_squared_error
+from tqdm import tqdm
+
 from cpfd_rom.util import config
 from cpfd_rom.util.output_utils import format_metadata
 
-def compute_rmse(X_true, X_pred, times, target_times, pivoted_columns, scaler):
-    """
-    Compute RMSE per snapshot and reconstruct snapshots for target_times.
 
-    Args:
-        X_true: numpy array (n_snapshots, n_features, 1)
-        X_pred: same shape as X_true
-        times: list of snapshot times
-        target_times: list of target times for visualization
-        pivoted_columns: MultiIndex from pivoted.columns (x, y, z)
-        scaler: fitted StandardScaler used for inverse transforming the predictions
-
-    Returns:
-        rmse_df: DataFrame with time, RMSE
-        merged_snapshots: list of (time, DataFrame) for visualization
+def _load_nodes_df() -> pd.DataFrame:
     """
-    # Inverse transform predictions back to physical units
-    X_pred_unscaled = scaler.inverse_transform(X_pred.reshape(X_pred.shape[0], -1)).reshape(X_pred.shape)
+    Load the canonical nodes (node_id, x, y, z, i, j, k) that graph_build.py wrote.
+    Location matches graph_build.ensure_graph_artifacts():
+        <config.output_dir>/graph/<config.test_dir>/nodes.parquet
+    """
+    nodes_path = Path(config.output_dir) / "graph" / config.test_dir / "nodes.parquet"
+    if not nodes_path.exists():
+        raise FileNotFoundError(
+            f"[ERROR] nodes.parquet not found at {nodes_path}. "
+            "Ensure graph_build.ensure_graph_artifacts() wrote it under config.output_dir/graph/<test_dir>/."
+        )
+    nodes_df = pd.read_parquet(nodes_path)
+    required = {"node_id", "x", "y", "z", "i", "j", "k"}
+    missing = required - set(nodes_df.columns)
+    if missing:
+        raise ValueError(f"[ERROR] nodes.parquet missing columns: {sorted(missing)}")
+    # Enforce canonical node order
+    nodes_df = nodes_df.sort_values("node_id").reset_index(drop=True)
+    return nodes_df
+
+
+def compute_rmse(X_true: np.ndarray,
+                 X_pred: np.ndarray,
+                 times: np.ndarray,
+                 target_times,
+                 pivoted_columns,  # kept for signature compatibility; not relied upon for coords anymore
+                 scaler):
+    """
+    Compute RMSE over time and write CPFD-style TXT files for ROM output including:
+      x, y, z, i, j, k, <field_variable>_ROM
+
+    Coordinates and (i,j,k) come from nodes.parquet written by graph_build.py,
+    guaranteeing the same node ordering used in training/graph construction.
+
+    Returns (rmse_df, merged_snapshots),
+      where merged_snapshots is a list of (t, DataFrame) including CFD and ROM columns.
+    """
+    # Shape checks
+    if X_true.ndim != 2 or X_pred.ndim != 2:
+        raise ValueError(f"Expected 2D arrays (S,N). Got X_true={X_true.shape}, X_pred={X_pred.shape}")
+    if X_true.shape != X_pred.shape:
+        raise ValueError(f"Shape mismatch: X_true={X_true.shape}, X_pred={X_pred.shape}")
+
+    S, N = X_true.shape
+
+    # Inverse scale (best-effort for X_true)
+    try:
+        X_true_phys = scaler.inverse_transform(X_true)
+    except Exception:
+        X_true_phys = X_true.copy()
+    X_pred_phys = scaler.inverse_transform(X_pred)
+
+    # Load canonical nodes once (ensures consistent ordering and (i,j,k))
+    nodes_df = _load_nodes_df()
+    if len(nodes_df) != N:
+        raise ValueError(
+            f"[ERROR] Node count mismatch: nodes.parquet has {len(nodes_df)} rows but predictions have N={N}."
+        )
+
+    # Prepare CPFD output dir
+    output_dir = os.path.join(config.output_dir, "ML")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Prepare metadata header (x,y,z,i,j,k,<field>)
+    field_name = config.field_variable
+    header_cols = ["x", "y", "z", "i", "j", "k", field_name]
+    header_md = [format_metadata(idx + 1, col) for idx, col in enumerate(header_cols)]
 
     rmse_list = []
     merged_snapshots = []
 
-    # Create output directory for Tecplot-formatted files
-    output_dir = os.path.join(config.output_dir, f"ML")
-    os.makedirs(output_dir, exist_ok=True)
+    # Write all snapshots
+    for s in tqdm(range(S), desc="Writing ROM output", unit="snapshot"):
+        t = float(times[s])
+        true_flat = X_true_phys[s].reshape(-1)
+        pred_flat = X_pred_phys[s].reshape(-1)
 
-    for i in range(X_true.shape[0]):
-        t = times[i]
-        true_flat = X_true[i].reshape(-1)
-        pred_flat = X_pred_unscaled[i].reshape(-1)
+        if getattr(config, "clip_predictions", False):
+            lo = getattr(config, "clip_min", 0.0)
+            hi = getattr(config, "clip_max", 1.0)
+            pred_flat = np.clip(pred_flat, lo, hi)
 
-        # Clip predictions to CFD-expected range (e.g., 0 to 1 for volume fraction)
-        pred_flat = np.clip(pred_flat, 0.0, 1.0)
-
+        # RMSE at this time
         rmse = root_mean_squared_error(true_flat, pred_flat)
         rmse_list.append((t, rmse))
 
-        # Collect merged snapshot for all times, not just target_times
-        N = len(true_flat)
-        x_coords = list(pivoted_columns.get_level_values("x"))[:N]
-        y_coords = list(pivoted_columns.get_level_values("y"))[:N]
-        z_coords = list(pivoted_columns.get_level_values("z"))[:N]
+        # Assemble full snapshot dataframe in canonical node order
+        df = nodes_df.copy()
+        df[f"{field_name}_CFD"] = true_flat
+        df[f"{field_name}_ROM"] = pred_flat
 
-        if not (len(x_coords) == len(y_coords) == len(z_coords) == N):
-            raise ValueError(f"[ERROR] Mismatch in spatial dimensions: x={len(x_coords)}, y={len(y_coords)}, z={len(z_coords)}, N={N}")
+        # For file writing, round xyz (cosmetic) and sort in CPFD-friendly (k,j,i)
+        df_out = df.copy()
+        df_out[["x", "y", "z"]] = df_out[["x", "y", "z"]].astype(np.float64).round(5)
+        df_out = df_out.sort_values(by=["k", "j", "i"], kind="mergesort").reset_index(drop=True)
 
-        df = pd.DataFrame({
-            "x": x_coords,
-            "y": y_coords,
-            "z": z_coords,
-            f"{config.field_variable}_CFD": true_flat,
-            f"{config.field_variable}_ROM": pred_flat
-        })
-        df[['x', 'y', 'z']] = df[['x', 'y', 'z']].astype(np.float64).round(5)
+        # Save CPFD-style TXT with ROM values (x y z i j k field_ROM)
+        filename = os.path.join(output_dir, f"cells_{t:09.3f}s.txt")
+        with open(filename, "w") as f:
+            f.write('# Zone name = "Cells"\n')
+            f.write(f"# Solution time = {t:.6f} s\n")
+            for line in header_md:
+                f.write(line)
+            df_out[["x", "y", "z", "i", "j", "k", f"{field_name}_ROM"]].to_csv(
+                f, sep="\t", header=False, index=False, float_format="%.6e"
+            )
+
+        # Keep a richer dataframe (with CFD & ROM) for diagnostics/plotting
         merged_snapshots.append((t, df))
 
-        # Write Tecplot-compatible ROM output
-        metadata_lines = [
-            format_metadata(1, "x"),
-            format_metadata(2, "y"),
-            format_metadata(3, "z"),
-            format_metadata(4, config.field_variable),
-        ]
-        df = df.sort_values(by=['z', 'y', 'x']).reset_index(drop=True)
-        filename = os.path.join(output_dir, f"cells_{t:09.3f}s.txt")
-        with open(filename, 'w') as f:
-            f.write(f"# Zone name = \"Cells\"\n")
-            f.write(f"# Solution time = {t:.6f} s\n")
-            for line in metadata_lines:
-                f.write(line)
-            df[['x', 'y', 'z', f"{config.field_variable}_ROM"]].to_csv(
-                f, sep='\t', header=False, index=False, float_format="%.6e")
-
-    rmse_df = pd.DataFrame(rmse_list, columns=['time', 'RMSE'])
-
-    # Plot RMSE vs time for all times
+    # RMSE timeline and plot
+    rmse_df = pd.DataFrame(rmse_list, columns=["time", "RMSE"])
     plt.figure(figsize=(8, 5))
-    plt.plot(rmse_df['time'], rmse_df['RMSE'], marker='o', linestyle='-')
-    plt.xlabel('Time (s)')
-    plt.ylabel('RMSE')
-    plt.title('RMSE vs Time (ML ROM)')
+    plt.plot(rmse_df["time"], rmse_df["RMSE"], marker="o", linestyle="-")
+    plt.xlabel("Time (s)")
+    plt.ylabel("RMSE")
+    plt.title("RMSE vs Time (ML ROM)")
     plt.grid(True)
     output_path = os.path.join(config.output_dir, "rmse_ml_eulerian.png")
     plt.savefig(output_path)

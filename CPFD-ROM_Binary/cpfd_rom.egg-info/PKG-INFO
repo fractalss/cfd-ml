@@ -8,6 +8,7 @@ Requires-Dist: numpy
 Requires-Dist: pandas
 Requires-Dist: scikit-learn
 Requires-Dist: tensorflow
+Requires-Dist: torch
 Requires-Dist: matplotlib
 Requires-Dist: pyyaml
 Requires-Dist: absl-py

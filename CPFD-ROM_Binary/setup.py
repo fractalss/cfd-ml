@@ -9,6 +9,7 @@ setup(
         "pandas",
         "scikit-learn",
         "tensorflow",
+        "torch",
         "matplotlib",
         "pyyaml",
         "absl-py"
