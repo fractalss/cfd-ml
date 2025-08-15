@@ -161,7 +161,7 @@ def run_ml_rom_pipeline(config, log_time):
                 lr=getattr(config, "lr", 1e-3),
                 hidden=getattr(config, "hidden", 64),
                 dropout=getattr(config, "dropout", 0.1),
-                lambda_smooth=getattr(config, "lambda_smooth", 0.0),
+                lambda_smooth=getattr(config, "lambda_smooth", 0.1),
                 add_time=False,
             )
             torch.save(model.state_dict(), model_path_pt)
