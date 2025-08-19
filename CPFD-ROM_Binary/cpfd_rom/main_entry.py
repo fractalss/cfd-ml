@@ -38,7 +38,7 @@ def load_config_from_yaml(yaml_path):
     # Prepend base_data_dir to rev_dirs and test_directory if defined
     if hasattr(config, 'base_data_dir'):
         config.rev_dirs = [os.path.join(config.base_data_dir, d) for d in config.rev_dirs]
-        config.test_directory = os.path.join(config.base_data_dir, config.test_dir)
+        # config.test_directory = os.path.join(config.base_data_dir, config.test_dir)
 
 def main():
     parser = argparse.ArgumentParser(

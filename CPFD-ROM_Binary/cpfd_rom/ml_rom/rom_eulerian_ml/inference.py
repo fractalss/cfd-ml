@@ -1,57 +1,70 @@
 # Saurav Mitra
-# inference_param.py (or inside pipeline.py)
-import numpy as np
-import pandas as pd
-import torch
-from pathlib import Path
-from torch_geometric.utils import to_undirected
+# inference.py  GCN inference helpers (XYZ(+time)+param -> field)
+from __future__ import annotations
+from typing import Optional
 
-def _build_features_xyz(nodes_df: pd.DataFrame) -> torch.Tensor:
-    feats = []
-    for c in ('x','y','z'):
-        v = nodes_df[c].to_numpy(dtype=np.float32)
-        mu, sd = float(v.mean()), float(v.std() if v.std() > 0 else 1.0)
-        feats.append(((v - mu) / sd).reshape(-1, 1))
-    import numpy as np
-    X = np.concatenate(feats, axis=1)
-    return torch.tensor(X, dtype=torch.float32)
+import numpy as np
+import torch
+import torch.nn as nn
+
+# Uses feature builder from the GCN module
+from .model_gnn import _concat_features
+
+
+__all__ = ["predict_gcn"]
+
+
+# ---------------------------------
+# Inference convenience
+# ---------------------------------
 
 @torch.no_grad()
-def infer_on_param(model, cfg, param_value: float, device='auto',
-                   time_mode='none', t_stats=None, fourier_m=4):
-    dev = (torch.device('cuda') if (device=='auto' and torch.cuda.is_available())
-           else torch.device(device if device!='auto' else 'cpu'))
+def predict_gcn(
+    model: nn.Module,
+    edge_index: torch.Tensor,
+    X_node: torch.Tensor,
+    params_row: np.ndarray,
+    *,
+    time_val: Optional[float] = None,
+    add_time: bool = False,
+    time_mode: str = "none",
+    t_min: float = 0.0,
+    t_max: float = 1.0,
+    t_mu: Optional[float] = None,
+    t_sigma: Optional[float] = None,
+    fourier_m: int = 4,
+) -> torch.Tensor:
+    """Return predicted field as a tensor shaped (N,).
 
-    graph_dir = Path(cfg['output_dir']) / 'graph' / cfg['test_dir']
-    nodes_df = pd.read_parquet(graph_dir / 'nodes.parquet').sort_values('node_id').reset_index(drop=True)
-    edges_df = pd.read_csv(graph_dir / 'edges_n6.csv')
-    edge_index = torch.tensor(edges_df[['src','dst']].to_numpy().T, dtype=torch.long)
-    edge_index = to_undirected(edge_index, num_nodes=len(nodes_df))
+    Args:
+        model: Trained ThreeLayerGCN (or compatible) model.
+        edge_index: Graph connectivity [2, E] on any device.
+        X_node: Static node features (e.g., standardized XYZ) shaped (N, F_node).
+        params_row: Global parameter vector for this snapshot, shape (P,).
+        time_val: Scalar time value for this snapshot, if time conditioning is enabled.
+        add_time: Whether to concatenate time features.
+        time_mode: "none" | "scalar" | "fourier".
+        t_min, t_max, t_mu, t_sigma, fourier_m: Same statistics/settings used in training.
 
-    # Node features [x,y,z] (standardized)
-    x = _build_features_xyz(nodes_df).to(dev)
+    Notes:
+        Ensure the same preprocessing used during training (XYZ standardization, parameter vector,
+        and time-feature configuration) is applied here for consistency.
+    """
+    device = next(model.parameters()).device
 
-    # Optional: time features (use t_stats from training if time_mode != 'none')
-    def _concat_time(x_t, t):
-        if time_mode == 'none':
-            return x_t
-        # scalar or Fourier time block  reuse your training-time implementation
-        from cpfd_rom.ml_rom.rom_eulerian_ml.model_gnn import time_block_for
-        tb = time_block_for(t, x_t.size(0), dev, x_t.dtype, time_mode, t_stats, fourier_m)
-        return torch.cat([x_t, tb], dim=1)
+    feats = _concat_features(
+        X_node.to(device),
+        params_row,
+        device,
+        add_time=add_time,
+        time_val=time_val,
+        time_mode=time_mode,
+        t_min=t_min,
+        t_max=t_max,
+        t_mu=t_mu,
+        t_sigma=t_sigma,
+        fourier_m=fourier_m,
+    )
 
-    # Append param scalar as an extra feature column
-    pcol = torch.full((x.size(0), 1), float(param_value), device=dev, dtype=x.dtype)
-
-    # Load times from test_dir (no CFD values needed)
-    times_df = pd.read_csv((Path(cfg['base_data_dir']) / cfg['test_dir'] / 'times.csv')).sort_values('time')
-    times = times_df['time'].to_numpy(dtype=float)
-
-    model = model.to(dev).eval()
-    preds = []
-    for t in times:
-        x_t = _concat_time(x, float(t))
-        feats = torch.cat([x_t, pcol], dim=1)   # [x,y,z,(time),param]
-        y = model(feats, edge_index).squeeze(-1).cpu().numpy()  # (N,)
-        preds.append(y)
-    return np.array(preds), times, nodes_df
+    y = model(feats, edge_index.to(device)).squeeze(-1)  # (N,)
+    return y

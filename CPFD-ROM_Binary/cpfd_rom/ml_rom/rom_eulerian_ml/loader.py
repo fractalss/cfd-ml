@@ -1,145 +1,203 @@
-# loader.py  loads snapshots, real times, and supports ordered or full zero-shot splits
-import os
+# loader.py  graph-first dataset loader for GCN (Eulerian)
+# Strictly for the gcn branch. Builds a canonical graph once and assembles
+# snapshot matrices (Y) + parameter arrays (P) across all training rev_dirs.
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Tuple, Sequence, Optional
+
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from cpfd_rom.util.io_utils import process_directory_npy
-from cpfd_rom.util import config
+import torch
 
+# Local project imports (gcn branch)
+from cpfd_rom.ml_rom.rom_eulerian_ml import graph_build
+from cpfd_rom.ml_rom.rom_eulerian_ml.model_gnn import build_node_features_xyz
 
-def _load_times_map(dir_path: str) -> dict:
-    """Return {filename -> time(float)} from times.csv, if present."""
-    tcsv = os.path.join(dir_path, "times.csv")
-    if not os.path.exists(tcsv):
-        return {}
-    df = pd.read_csv(tcsv)
-    if not {"time", "filename"}.issubset(df.columns):
-        return {}
-    df = df.dropna(subset=["time", "filename"])  # clean
-    return {str(row["filename"]): float(row["time"]) for _, row in df.iterrows()}
+__all__ = [
+    "list_targets",
+    "load_target_vec",
+    "build_canonical_graph",
+    "prepare_graph_and_datasets",
+]
 
+# -----------------------------------------------------------------------------
+# File/system helpers
+# -----------------------------------------------------------------------------
 
-def _build_pivoted_columns(coords_xyz: np.ndarray) -> pd.MultiIndex:
-    """Create a MultiIndex [(x,y,z), ...] for N nodes from an (N,3) array."""
-    tuples = [tuple(map(float, row)) for row in coords_xyz]
-    return pd.MultiIndex.from_tuples(tuples, names=["x", "y", "z"])
+def list_targets(graph_dir: Path) -> List[Tuple[float, Path]]:
+    """List snapshot files as (time, path), sorted by time.
 
-
-def load_and_preprocess_eulerian_data_npy():
+    Accepts files named like: target_<time>s.parquet or target_<time>s.csv
+    Example: target_0050.0s.parquet -> time=50.0
     """
-    Loads all snapshots from config.rev_dirs, reads real times from times.csv, builds
-    a fixed coordinate mapping, scales snapshots, and returns train/test splits with
-    optional ordered splitting or full zero-shot test over all snapshots.
+    snap_dir = Path(graph_dir) / "snapshots"
+    files = sorted(list(snap_dir.glob("target_*.parquet")) + list(snap_dir.glob("target_*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No target_* files found in {snap_dir}")
+
+    out: List[Tuple[float, Path]] = []
+    for p in files:
+        name = p.stem  # e.g., target_0050.0s
+        if not (name.startswith("target_") and name.endswith("s")):
+            continue
+        t_str = name[len("target_"):-1]
+        try:
+            tt = float(t_str)
+        except Exception:
+            continue
+        out.append((tt, p))
+    return sorted(out, key=lambda t: t[0])
+
+
+def load_target_vec(path: Path) -> np.ndarray:
+    """Load a single snapshot vector (N,) from parquet/csv.
+    Expects exactly ONE numeric target column in the file. If known index/coord
+    columns are present, they are ignored. Raises if ambiguity remains.
+    """
+    df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+    # Drop known non-target numeric columns if present
+    drop_cols = {"node_id", "i", "j", "k", "x", "y", "z"}
+    cols = [c for c in df.columns if c not in drop_cols]
+    numeric = df[cols].select_dtypes(include=[np.number])
+
+    if numeric.shape[1] == 1:
+        return numeric.iloc[:, 0].to_numpy(dtype=np.float32).reshape(-1)
+
+    # Fallback: if the whole frame has exactly one numeric col, use it
+    all_numeric = df.select_dtypes(include=[np.number])
+    if all_numeric.shape[1] == 1:
+        return all_numeric.iloc[:, 0].to_numpy(dtype=np.float32).reshape(-1)
+
+    raise ValueError(
+        f"Ambiguous target columns in {path.name}: found {numeric.shape[1]} numeric columns after filtering; "
+        "expected exactly one. Ensure snapshots contain only the target column."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Canonical graph + datasets
+# -----------------------------------------------------------------------------
+
+def build_canonical_graph(cfg: Dict, *, neighbor_set: str = "n6") -> Tuple[str, Path, pd.DataFrame, np.ndarray, torch.Tensor]:
+    """Create/ensure graph artifacts for the FIRST training rev and return graph objects.
 
     Returns
     -------
-    X_train : (S_train, N, 1)
-    X_test  : (S_test,  N, 1)
-    P_train : (S_train, P)  (P is usually 1)
-    P_test  : (S_test,  P)
-    scaler  : fitted MinMaxScaler
-    pivoted_columns : MultiIndex of length N with names (x,y,z)
+    ref_rev_key : str
+        Basename (e.g., "Rev1_npy") of the reference training revision.
+    ref_graph_dir : Path
+        Directory containing nodes.parquet and snapshots/ for the reference rev.
+    nodes_df : pd.DataFrame
+        Canonical node table with columns [node_id, x,y,z, i,j,k].
+    edge_index : np.ndarray
+        2xE undirected edge list with 0-based node indices matching nodes_df.node_id.
+    X_node : torch.Tensor
+        (N, F_node) static node features (standardized XYZ) as float32 tensor (CPU).
     """
-    all_X = []           # list of (S_dir, N) arrays
-    all_P = []           # per-snapshot global param values
-    all_times = []       # per-snapshot times (float seconds)
-    coords_ref = None    # (N,3) from the first snapshot seen
+    revs: List[str] = list(cfg["rev_dirs"]) if isinstance(cfg.get("rev_dirs"), (list, tuple)) else []
+    if not revs:
+        raise ValueError("cfg['rev_dirs'] must list training directories")
 
-    # Loader knobs with sensible defaults
-    test_size_cfg = getattr(config, "test_size", 0.20)              # float in (0,1]; 1.0 ? all test
-    preserve_time_order = getattr(config, "preserve_time_order", True)
-    zero_shot_use_all = getattr(config, "zero_shot_use_all", False)
+    ref_rev = revs[0]
+    ref_rev_key = Path(ref_rev).name  # support absolute or relative entries
 
-    # Iterate each revision directory
-    for path in config.rev_dirs:
-        dir_path = str(path)
+    # Ensure artifacts for reference rev (nodes, edges, targets)
+    ref_graph_dir = graph_build.ensure_graph_artifacts(
+        {**cfg, "test_dir": ref_rev_key}, cfg["field_variable"], rebuild=bool(cfg.get("rebuild_graph", False)), neighbor_set=neighbor_set
+    )
 
-        # 1) Load field snapshots (S_dir, N)
-        X_dir, _ = process_directory_npy(dir_path, config.field_variable)
-        S_dir, N = X_dir.shape
-        all_X.append(X_dir)
+    # Load nodes and build edges (canonical order by node_id)
+    nodes_df = pd.read_parquet(Path(ref_graph_dir) / "nodes.parquet").sort_values("node_id").reset_index(drop=True)
+    edge_index = graph_build.build_edge_index(nodes_df[["i", "j", "k"]], neighbor_set=neighbor_set, bidirectional=True)
 
-        # 2) Parameter value for this directory (replicated per snapshot)
-        param_value = config.param_mapping[os.path.basename(dir_path)]
-        all_P.extend([param_value] * S_dir)
+    # Static node features (standardized xyz); keep on CPU here
+    X_node = build_node_features_xyz(nodes_df)
+    return ref_rev_key, Path(ref_graph_dir), nodes_df, edge_index, X_node
 
-        # 3) Real times per snapshot (aligned to filenames)
-        times_map = _load_times_map(dir_path)
-        npy_files = sorted([f for f in os.listdir(dir_path) if f.endswith('.npy')])
-        # If more files than S_dir (or vice versa), only use the first S_dir
-        npy_files = npy_files[:S_dir]
-        for idx, fname in enumerate(npy_files):
-            all_times.append(float(times_map.get(fname, idx)))  # fallback: sequential index
 
-        # 4) Coordinates reference from the first snapshot
-        if coords_ref is None:
-            # Try to read coords from the first file (assumes columns x,y,z first)
-            snap0 = np.load(os.path.join(dir_path, npy_files[0]))
-            coords_ref = snap0[:, :3].astype(float)  # (N,3)
+def prepare_graph_and_datasets(
+    cfg: Dict,
+    *,
+    neighbor_set: str = "n6",
+    val_frac: float = 0.2,
+) -> Tuple[
+    str, Path, pd.DataFrame, np.ndarray, torch.Tensor,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]
+]:
+    """Build canonical graph (from first rev) and assemble datasets from all revs.
 
-    # Stack to arrays
-    X_all = np.vstack(all_X)                 # (S_total, N)
-    S_total, N = X_all.shape
-    all_P = np.asarray(all_P, dtype=np.float32).reshape(S_total, -1)  # (S_total, P)
-    all_times = np.asarray(all_times, dtype=np.float64)               # (S_total,)
+    Returns
+    -------
+    (ref_rev_key, ref_graph_dir, nodes_df, edge_index, X_node,
+     Y_train, Y_val, P_train, P_val, times_train, times_val)
 
-    # Scale to (S_total, N, 1)
-    scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X_all).reshape(S_total, N, 1)
+    Shapes:
+        Y_*: (S, N)  with N = number of nodes
+        P_*: (S, P)  (P often = 1; e.g., inlet velocity)
+        times_*: (S,) float seconds or None if not available
+    """
+    out_root = Path(cfg["output_dir"]) / "graph"
 
-    # Build pivoted columns from coords_ref
-    if coords_ref is None:
-        raise RuntimeError("No coordinates found to build pivoted_columns.")
-    if coords_ref.shape[0] != N:
-        # Align coordinate count with features if necessary
-        coords_ref = coords_ref[:N]
-    pivoted_columns = _build_pivoted_columns(coords_ref)
+    # 1) Build canonical graph
+    ref_rev_key, ref_graph_dir, nodes_df, edge_index, X_node = build_canonical_graph(cfg, neighbor_set=neighbor_set)
 
-    # Expose times for downstream consumers
-    config.all_times = all_times
+    # 2) Ensure snapshot artifacts for all revs (only targets; nodes/edges from ref)
+    revs: List[str] = list(cfg["rev_dirs"]) if isinstance(cfg.get("rev_dirs"), (list, tuple)) else []
+    for r in revs[1:]:
+        r_key = Path(r).name
+        graph_build.ensure_graph_artifacts({**cfg, "test_dir": r_key}, cfg["field_variable"], rebuild=bool(cfg.get("rebuild_graph", False)), neighbor_set=neighbor_set)
 
-    # -------------------------------
-    # Split logic
-    # -------------------------------
-    if zero_shot_use_all or (isinstance(test_size_cfg, (int, float)) and float(test_size_cfg) >= 1.0):
-        # Use ALL snapshots as test set (no training split)
-        X_train = X_scaled[:0]
-        P_train = all_P[:0]
-        X_test  = X_scaled
-        P_test  = all_P
-        config.train_times = np.asarray([], dtype=np.float64)
-        config.test_times  = all_times
-    else:
-        # Convert test_size to float in (0,1)
-        if isinstance(test_size_cfg, int):
-            test_size = max(1, int(test_size_cfg)) / float(S_total)
-        else:
-            test_size = float(test_size_cfg)
-        test_size = min(max(test_size, 0.0), 0.99)  # keep a non-empty train set
+    # 3) Assemble Y/P/times
+    Y_train_list: List[np.ndarray] = []
+    Y_val_list: List[np.ndarray] = []
+    P_train_list: List[np.ndarray] = []
+    P_val_list: List[np.ndarray] = []
+    T_train_list: List[float] = []
+    T_val_list: List[float] = []
 
-        if preserve_time_order:
-            # Sequential split: first (1-test_size) for train, last test_size for test
-            split_at = int(round(S_total * (1.0 - test_size)))
-            split_at = min(max(split_at, 1), S_total - 1)
-            X_train = X_scaled[:split_at]
-            P_train = all_P[:split_at]
-            X_test  = X_scaled[split_at:]
-            P_test  = all_P[split_at:]
-            config.train_times = all_times[:split_at]
-            config.test_times  = all_times[split_at:]
-        else:
-            # Shuffle-based split with fixed seed; keep times aligned
-            idx = np.arange(S_total)
-            rng = np.random.default_rng(42)
-            rng.shuffle(idx)
-            n_test = int(round(S_total * test_size))
-            test_idx = np.sort(idx[:n_test])
-            train_idx = np.sort(idx[n_test:])
-            X_train = X_scaled[train_idx]
-            P_train = all_P[train_idx]
-            X_test  = X_scaled[test_idx]
-            P_test  = all_P[test_idx]
-            config.train_times = all_times[train_idx]
-            config.test_times  = all_times[test_idx]
+    for r in revs:
+        r_key = Path(r).name  # support absolute or relative
+        graph_dir = out_root / r_key
+        targets = list_targets(graph_dir)
+        times = np.array([t for t, _ in targets], dtype=float)
+        n = len(targets)
+        n_train = max(1, int((1.0 - val_frac) * n))
 
-    return X_train, X_test, P_train, P_test, scaler, pivoted_columns
+        # Parameter value for this rev
+        if "param_mapping" not in cfg or r_key not in cfg["param_mapping"]:
+            raise KeyError(f"param_mapping missing for rev '{r}' (key '{r_key}') in cfg")
+        pval = float(cfg["param_mapping"][r_key])
+        P_row = np.array([pval], dtype=np.float32)
+
+        # Load snapshot vectors (in canonical node order)
+        Ys = np.stack([load_target_vec(p) for _, p in targets], axis=0)  # (S, N)
+
+        Y_train_list.append(Ys[:n_train])
+        Y_val_list.append(Ys[n_train:])
+        P_train_list.append(np.repeat(P_row[None, :], n_train, axis=0))
+        P_val_list.append(np.repeat(P_row[None, :], n - n_train, axis=0))
+        T_train_list.extend(times[:n_train].tolist())
+        T_val_list.extend(times[n_train:].tolist())
+
+    Y_train = np.concatenate(Y_train_list, axis=0) if Y_train_list else np.empty((0, len(nodes_df)), dtype=np.float32)
+    Y_val = np.concatenate(Y_val_list, axis=0) if Y_val_list else np.empty((0, len(nodes_df)), dtype=np.float32)
+    P_train = np.concatenate(P_train_list, axis=0) if P_train_list else np.empty((0, 1), dtype=np.float32)
+    P_val = np.concatenate(P_val_list, axis=0) if P_val_list else np.empty((0, 1), dtype=np.float32)
+    times_train = np.array(T_train_list, dtype=float) if T_train_list else None
+    times_val = np.array(T_val_list, dtype=float) if T_val_list else None
+
+    return (
+        ref_rev_key,
+        ref_graph_dir,
+        nodes_df,
+        edge_index,
+        X_node,
+        Y_train,
+        Y_val,
+        P_train,
+        P_val,
+        times_train,
+        times_val,
+    )
