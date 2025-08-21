@@ -91,11 +91,29 @@ def _nodes_to_edge_index(nodes: pd.DataFrame, *, neighbor_set: str = 'n6', bidir
 def _build_nodes_and_edges(df_ref: pd.DataFrame, out_dir: Path, edge_bidir: bool = True, *, neighbor_set: str = 'n6'):
     print(f"[GRAPH] Building nodes & edges into {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preserve FILE/FLATTEN order as provided by df_ref (earliest NPY snapshot)
+    # 1) Write coords_file_order.parquet (exact file order used by Y columns)
+    coords_cols = [c for c in ['i','j','k','x','y','z'] if c in df_ref.columns]
+    coords_file_df = df_ref[coords_cols].copy().reset_index(drop=True)
+    (out_dir / 'coords_file_order.parquet').unlink(missing_ok=True)
+    coords_file_df.to_parquet(out_dir / 'coords_file_order.parquet', index=False)
+    print(f"[GRAPH] wrote coords_file_order.parquet with columns {coords_cols} (rows={len(coords_file_df)})")
+
+    # 2) Nodes dataframe in NODE order  currently we keep the same order as df_ref
     nodes = _df_to_nodes_df(df_ref)
+    (out_dir / 'nodes.parquet').unlink(missing_ok=True)
     nodes.to_parquet(out_dir / 'nodes.parquet', index=False)
 
+    # 3) FILE?NODE mapping (colmap); identity because nodes preserve df_ref order
+    colmap = np.arange(len(nodes), dtype=np.int64)
+    np.save(out_dir / 'colmap_file_to_nodes.npy', colmap)
+    print(f"[GRAPH] wrote colmap_file_to_nodes.npy (identity, length={len(colmap)})")
+
+    # 4) Edges in NODE index space
     edge_index = _nodes_to_edge_index(nodes, neighbor_set=neighbor_set, bidirectional=edge_bidir)
     edges_df = pd.DataFrame({'src': edge_index[0], 'dst': edge_index[1]}, dtype=np.int64)
+    (out_dir / f'edges_{neighbor_set}.csv').unlink(missing_ok=True)
     edges_df.to_csv(out_dir / f'edges_{neighbor_set}.csv', index=False)
 
     print(f"[GRAPH] nodes={len(nodes)}  edges={len(edges_df)} (directed entries)")
@@ -104,7 +122,12 @@ def _build_nodes_and_edges(df_ref: pd.DataFrame, out_dir: Path, edge_bidir: bool
 
 def ensure_graph_artifacts(cfg, field_var: str, rebuild: bool = False, *, neighbor_set: str = 'n6') -> Path:
     """Create graph artifacts under <base>/rom_output_gnn/graph/<test_dir>/ using NPY snapshots.
-    Writes: nodes.parquet, edges_{neighbor_set}.csv, and snapshots/target_*.parquet for field_var.
+    Writes:
+      - nodes.parquet (NODE order)
+      - edges_{neighbor_set}.csv (NODE indices)
+      - coords_file_order.parquet (FILE/FLATTEN order of columns in Y; columns: i,j,k,[x,y,z])
+      - colmap_file_to_nodes.npy (FILE?NODE mapping; identity if nodes keep df_ref order)
+      - snapshots/target_*.parquet for field_var (in NODE order)
     """
     base = Path(cfg['base_data_dir']); test_dir = cfg['test_dir']
     src_dir = base / test_dir

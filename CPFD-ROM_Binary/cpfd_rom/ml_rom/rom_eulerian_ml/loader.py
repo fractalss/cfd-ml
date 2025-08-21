@@ -117,6 +117,39 @@ def build_canonical_graph(cfg: Dict, *, neighbor_set: str = "n6") -> Tuple[str, 
     return ref_rev_key, Path(ref_graph_dir), nodes_df, edge_index, X_node
 
 
+
+def stratified_time_split(times: np.ndarray, val_frac: float = 0.2, *,
+                          bins: int = 10, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Stratify by time using equal-width bins across [min(times), max(times)].
+    Samples ~val_frac from each non-empty bin (at least 1 if bin has any items).
+    Returns (train_idx, val_idx) sorted in ascending order.
+    """
+    times = np.asarray(times, dtype=float).reshape(-1)
+    n = times.size
+    idx_all = np.arange(n)
+
+    # choose #bins sensibly for small n
+    bins = max(3, min(bins, n))  # at least 3, at most n
+    edges = np.linspace(times.min(), times.max(), bins + 1)
+
+    rng = np.random.default_rng(seed)
+    val_mask = np.zeros(n, dtype=bool)
+
+    for b in range(bins):
+        left, right = edges[b], edges[b + 1]
+        in_bin = np.where((times >= left) & (times < right if b < bins - 1 else times <= right))[0]
+        if in_bin.size == 0:
+            continue
+        k = max(1, int(round(val_frac * in_bin.size)))
+        choose = rng.choice(in_bin, size=min(k, in_bin.size), replace=False)
+        val_mask[choose] = True
+
+    train_idx = idx_all[~val_mask]
+    val_idx = idx_all[val_mask]
+    train_idx.sort(); val_idx.sort()
+    return train_idx, val_idx
+
 def prepare_graph_and_datasets(
     cfg: Dict,
     *,
@@ -162,8 +195,6 @@ def prepare_graph_and_datasets(
         graph_dir = out_root / r_key
         targets = list_targets(graph_dir)
         times = np.array([t for t, _ in targets], dtype=float)
-        n = len(targets)
-        n_train = max(1, int((1.0 - val_frac) * n))
 
         # Parameter value for this rev
         if "param_mapping" not in cfg or r_key not in cfg["param_mapping"]:
@@ -174,12 +205,17 @@ def prepare_graph_and_datasets(
         # Load snapshot vectors (in canonical node order)
         Ys = np.stack([load_target_vec(p) for _, p in targets], axis=0)  # (S, N)
 
-        Y_train_list.append(Ys[:n_train])
-        Y_val_list.append(Ys[n_train:])
-        P_train_list.append(np.repeat(P_row[None, :], n_train, axis=0))
-        P_val_list.append(np.repeat(P_row[None, :], n - n_train, axis=0))
-        T_train_list.extend(times[:n_train].tolist())
-        T_val_list.extend(times[n_train:].tolist())
+        # --- Stratified split over time (80:20 across full time range) ---
+        split_seed = int(cfg.get("split_seed", 42)) if isinstance(cfg, dict) else 42
+        bins = max(3, min(10, len(times)))  # keep bins sensible
+        tr_idx, va_idx = stratified_time_split(times, val_frac=val_frac, bins=bins, seed=split_seed)
+
+        Y_train_list.append(Ys[tr_idx])
+        Y_val_list.append(Ys[va_idx])
+        P_train_list.append(np.repeat(P_row[None, :], tr_idx.size, axis=0))
+        P_val_list.append(np.repeat(P_row[None, :], va_idx.size, axis=0))
+        T_train_list.extend(times[tr_idx].tolist())
+        T_val_list.extend(times[va_idx].tolist())
 
     Y_train = np.concatenate(Y_train_list, axis=0) if Y_train_list else np.empty((0, len(nodes_df)), dtype=np.float32)
     Y_val = np.concatenate(Y_val_list, axis=0) if Y_val_list else np.empty((0, len(nodes_df)), dtype=np.float32)

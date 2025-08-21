@@ -1,22 +1,16 @@
 import os
-import pandas as pd
-import numpy as np
+import sys
+import gc
 import time
 from contextlib import contextmanager
 import argparse
-import yaml
-import os
-import sys
-import gc
-# import tensorflow as tf
 
-from cpfd_rom.util import config
-from cpfd_rom.util.io_utils import process_directory_npy
-# from cpfd_rom.util.lagrangian_io import process_directory_lagrangian
+from cpfd_rom.util.config import load_config, overlay_cli
 from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import run_ml_rom_pipeline
-# from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
 from cpfd_rom.pca_rbf_rom.rom_eulerian_pca_rbf.pipeline import run_eulerian_pca_rbf_pipeline
+# from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
 # from cpfd_rom.pca_rbf_rom.rom_lagrangian_pca_rbf.pipeline import run_lagrangian_pca_rbf_pipeline
+
 
 @contextmanager
 def log_time(task_name):
@@ -25,93 +19,95 @@ def log_time(task_name):
     end = time.time()
     print(f"[Timing] {task_name} took {end - start:.2f} seconds")
 
+
 def clear_memory():
-    # tf.keras.backend.clear_session()
     gc.collect()
 
-def load_config_from_yaml(yaml_path):
-    with open(yaml_path, 'r') as f:
-        user_config = yaml.safe_load(f)
-    for key, value in user_config.items():
-        setattr(config, key, value)
 
-    # Prepend base_data_dir to rev_dirs and test_directory if defined
-    if hasattr(config, 'base_data_dir'):
-        config.rev_dirs = [os.path.join(config.base_data_dir, d) for d in config.rev_dirs]
-        # config.test_directory = os.path.join(config.base_data_dir, config.test_dir)
+def _truthy(x):
+    return str(x).strip().lower() in ("1", "true", "t", "yes", "y")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="""
-    Run ROM pipelines with configuration specified in a YAML file.
-
-    Example usage:
-      rom-cli --config_yaml rom_inputs.yaml
-
-    The YAML file should define the following fields:
-
-      rom_type:         Type of ROM to use. One of ['ML', 'PCA-RBF']
-      type_of_field:    Type of field data. One of ['Eulerian', 'Lagrangian']
-      field_variable:   CFD field to model (e.g., 'particle volume fraction')
-
-      base_data_dir:    Path to the folder containing all rev_dirs and test_directory
-      rev_dirs:         List of folders used for training, relative to base_data_dir
-      vel_mapping:      Dictionary mapping each rev_dir to a velocity value
-
-      test_directory:   Folder used for testing, relative to base_data_dir
-
-      target_times:     List of snapshot times to evaluate (e.g., [10.0, 20.0])
-      user_velocity:    The velocity condition to simulate/test (e.g., 11.0)
-
-      vel_mapping:      Mapping of training folders to velocities (e.g., {'Rev1': 10, 'Rev2': 12})
-      test_times:       [Optional] Times available in the test directory for interpolation
-
-    """,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description=(
+            "Run ROM pipelines with configuration from a YAML file.\n\n"
+            "Example:\n  rom-cli-bin --config rom_inputs.yaml --add_time true --time_mode fourier --fourier_m 8\n\n"
+            "YAML (revised schema) top-level keys include: rom_type, type_of_field, field_variable,\n"
+            "base_data_dir, rev_dirs, param_mapping, user_parameter, conv_type, gat_heads, attn_dropout,\n"
+            "time_mode, fourier_m, [add_time], skip_training, rebuild_graph."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("--config_yaml", type=str, required=True,
+    # Accept both --config and --config_yaml for backward compatibility
+    parser.add_argument("--config", "--config_yaml", dest="config_path", required=True,
                         help="Path to YAML file with all configuration options.")
 
-    args, unknown = parser.parse_known_args()
+    # Optional CLI overrides (Fix 1). We accept both snake_case and kebab-case aliases.
+    parser.add_argument("--add_time", "--add-time", dest="add_time", default=None)
+    parser.add_argument("--time_mode", "--time-mode", dest="time_mode", default=None)
+    parser.add_argument("--fourier_m", "--fourier-m", dest="fourier_m", type=int, default=None)
+    parser.add_argument("--conv_type", "--conv-type", dest="conv_type", default=None)
+    parser.add_argument("--gat_heads", "--gat-heads", dest="gat_heads", type=int, default=None)
+    parser.add_argument("--attn_dropout", "--attn-dropout", dest="attn_dropout", type=float, default=None)
 
-    if '-h' in sys.argv or '--help' in sys.argv:
-        parser.print_help()
-        sys.exit(0)
+    args, _ = parser.parse_known_args()
 
-    clear_memory()  # Clear memory before execution
+    clear_memory()
 
-    load_config_from_yaml(args.config_yaml)
+    # Load YAML -> ROMConfig
+    cfg = load_config(args.config_path)
 
-    # if config.type_of_field == "Eulerian":
-    #     config.model_path = getattr(config, 'model_path_eulerian', 'cnn_autoencoder_eulerian.keras')
-    # else:
+    # Overlay CLI overrides (only those provided)
+    overrides = {}
+    if args.add_time is not None:
+        overrides["add_time"] = _truthy(args.add_time)
+    if args.time_mode is not None:
+        overrides["time_mode"] = args.time_mode
+    if args.fourier_m is not None:
+        overrides["fourier_m"] = args.fourier_m
+    if args.conv_type is not None:
+        overrides["conv_type"] = args.conv_type
+    if args.gat_heads is not None:
+        overrides["gat_heads"] = args.gat_heads
+    if args.attn_dropout is not None:
+        overrides["attn_dropout"] = args.attn_dropout
 
+    if overrides:
+        cfg = overlay_cli(cfg, **overrides)
 
-    # if config.type_of_field == "Lagrangian":
-    #     config.test_times, config.test_df = process_directory_lagrangian(config.test_directory)
-    # else:
-    #     # config.test_df = process_directory(config.test_directory)
-    #     # config.test_times = sorted(config.test_df['time'].unique())
-    #     X_test, param_test = process_directory_npy(config.test_directory, config.field_variable)
-    #     config.test_X = X_test
-    #     config.test_param_values = param_test
-    #     config.test_times = param_test[:, 1].astype(np.float32)  # assuming column 1 is time
+    # Prepend base_data_dir to rev_dirs if relative
+    if getattr(cfg, "base_data_dir", None) and getattr(cfg, "rev_dirs", None):
+        rooted = []
+        for d in cfg.rev_dirs:
+            rooted.append(d if os.path.isabs(d) else os.path.join(cfg.base_data_dir, d))
+        cfg.rev_dirs = rooted
 
-    if config.rom_type == "ML" and config.type_of_field == "Eulerian":
-        config.model_path = getattr(config, 'model_path_eulerian', 'cnn_autoencoder_eulerian.keras')
-        run_ml_rom_pipeline(config, log_time)
-    elif config.rom_type == "ML" and config.type_of_field == "Lagrangian":
-        config.model_path = getattr(config, 'model_path_lagrangian', 'cnn_autoencoder_lagrangian.keras')
-        run_lagrangian_ml_pipeline(config, log_time)
-    elif config.rom_type == "PCA-RBF" and config.type_of_field == "Eulerian":
-        run_eulerian_pca_rbf_pipeline(config, log_time)
-    elif config.rom_type == "PCA-RBF" and config.type_of_field == "Lagrangian":
-        run_lagrangian_pca_rbf_pipeline(config, log_time)
+    print(
+        "[MAIN] Effective:",
+        "add_time=", getattr(cfg, "add_time", None),
+        "time_mode=", getattr(cfg, "time_mode", None),
+        "fourier_m=", getattr(cfg, "fourier_m", None),
+        "conv_type=", getattr(cfg, "conv_type", None),
+    )
+
+    # Route to the requested pipeline
+    if cfg.rom_type == "ML" and cfg.type_of_field == "Eulerian":
+        run_ml_rom_pipeline(cfg, log_time)
+    elif cfg.rom_type == "ML" and cfg.type_of_field == "Lagrangian":
+        # run_lagrangian_ml_pipeline(cfg, log_time)
+        raise NotImplementedError("Lagrangian ML pipeline is not wired in this entry point.")
+    elif cfg.rom_type == "PCA-RBF" and cfg.type_of_field == "Eulerian":
+        run_eulerian_pca_rbf_pipeline(cfg, log_time)
+    elif cfg.rom_type == "PCA-RBF" and cfg.type_of_field == "Lagrangian":
+        # run_lagrangian_pca_rbf_pipeline(cfg, log_time)
+        raise NotImplementedError("Lagrangian PCA-RBF pipeline is not wired in this entry point.")
     else:
         raise ValueError("Unsupported ROM type or field type in config.")
 
-    clear_memory()  # Clear memory after execution
+    clear_memory()
+
 
 if __name__ == "__main__":
     main()

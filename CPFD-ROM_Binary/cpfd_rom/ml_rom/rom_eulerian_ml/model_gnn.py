@@ -197,6 +197,7 @@ def _concat_features(
     t_mu: Optional[float] = None,
     t_sigma: Optional[float] = None,
     fourier_m: int = 4,
+    time_gain: float = 1.0,
 ) -> torch.Tensor:
     """
     Build per-node features:
@@ -210,6 +211,7 @@ def _concat_features(
         tb = _time_block_for(
             time_val, N, device, dtype, time_mode, t_min, t_max, t_mu, t_sigma, fourier_m
         )
+        tb = tb * float(time_gain)
         feats.append(tb)
     return torch.cat(feats, dim=1)  # (N, F_node+P+T)
 
@@ -238,9 +240,11 @@ def _eval_set(
     t_mu: Optional[float] = None,
     t_sigma: Optional[float] = None,
     fourier_m: int = 4,
+    time_gain: float = 1.0,
 ) -> float:
     model.eval()
     loss_fn = nn.MSELoss()
+
     losses = []
     for s in range(Y.shape[0]):
         feats = _concat_features(
@@ -255,6 +259,7 @@ def _eval_set(
             t_mu=t_mu,
             t_sigma=t_sigma,
             fourier_m=fourier_m,
+            time_gain=time_gain,
         )
         y_true = torch.from_numpy(Y[s].astype(np.float32)).to(device).reshape(-1, 1)
         y_pred = model(feats, edge_index)
@@ -278,24 +283,45 @@ def train_gcn_model(
     dropout: float = 0.1,
     lambda_smooth: float = 0.0,
     device: Optional[str] = None,
+    shuffle: bool = True,  # <--- NEW
+    shuffle_seed: Optional[int] = None,  # <--- NEW
     # Optional time conditioning
     add_time: bool = False,
     times_train: Optional[np.ndarray] = None,
     times_test: Optional[np.ndarray] = None,
     time_mode: str = "none",
     fourier_m: int = 4,
+    time_gain: float = 1.0,
+    # Data pruning
+    ignore_head_frac: float = 0.0,
     **kw,
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Graph-first training:
       inputs = [X_node | params | (time?)]  --> predict field
       targets = Y_* (field)
+
+    Parameters:
+      ignore_head_frac : float in [0,1)
+          If > 0, drop the first fraction of TRAIN snapshots (by current order in
+          Y_train/P_train/times_train) before training. This does not touch validation.
+          Useful to exclude early transients from model fitting.
     """
     assert Y_train.ndim == 2 and Y_test.ndim == 2, "Y_* must be (S, N)"
     assert P_train.ndim == 2 and P_test.ndim == 2, "P_* must be (S, P)"
     assert (
         Y_train.shape[0] == P_train.shape[0] and Y_test.shape[0] == P_test.shape[0]
     ), "Snapshot count mismatch"
+    # --- Optionally drop the first fraction of training snapshots ---
+    if ignore_head_frac and float(ignore_head_frac) > 0.0:
+        S0 = int(Y_train.shape[0])
+        k = max(0, min(S0, int(np.floor(float(ignore_head_frac) * S0))))
+        if k > 0:
+            Y_train = Y_train[k:]
+            P_train = P_train[k:]
+            if times_train is not None:
+                times_train = times_train[k:]
+            print(f"[PRUNE] Ignored first {k}/{S0} (~{(100.0*k/max(1,S0)):.1f}%) training snapshots (ignore_head_frac={ignore_head_frac}).")
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,6 +356,12 @@ def train_gcn_model(
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
+    # --- Early stopping config (from kwargs / pipeline) ---
+    early_stopping = bool(kw.pop("early_stopping", True))
+    es_patience = int(kw.pop("es_patience", 20))
+    es_min_delta = float(kw.pop("es_min_delta", 0.0))
+    es_restore_best = bool(kw.pop("es_restore_best", True))
+
     # Time stats
     if add_time and times_train is not None and len(times_train) == Y_train.shape[0]:
         t_mu = float(np.mean(times_train))
@@ -341,10 +373,22 @@ def train_gcn_model(
         t_min, t_max = 0.0, 1.0
 
     hist = {"train_mse": [], "val_mse": [], "val_rmse": []}
+    # --- Early stopping state ---
+    best_val = float("inf")
+    best_state = None
+    no_improve = 0
+    # --- NEW: reproducible RNG for shuffling ---
+    if shuffle_seed is not None:
+        np.random.seed(int(shuffle_seed))
+        torch.manual_seed(int(shuffle_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(shuffle_seed))
 
     for epoch in range(1, epochs + 1):
         model.train()
-        order = np.arange(Y_train.shape[0])  # keep sequential order, no shuffling
+
+        order = np.random.permutation(Y_train.shape[0]) if shuffle else np.arange(Y_train.shape[0])
+
         epoch_loss = 0.0
 
         for s in order:
@@ -360,6 +404,7 @@ def train_gcn_model(
                 t_mu=t_mu,
                 t_sigma=t_sigma,
                 fourier_m=fourier_m,
+                time_gain=time_gain,
             )
             y_true = torch.from_numpy(Y_train[s].astype(np.float32)).to(dev).reshape(-1, 1)
 
@@ -388,6 +433,7 @@ def train_gcn_model(
             t_mu=t_mu,
             t_sigma=t_sigma,
             fourier_m=fourier_m,
+            time_gain=time_gain,
         )
         val_rmse = math.sqrt(val_mse) if val_mse == val_mse else float("nan")  # guard NaN
 
@@ -398,5 +444,21 @@ def train_gcn_model(
         print(
             f"[EPOCH {epoch:03d}] train_MSE={train_mse:.6e}  val_MSE={val_mse:.6e}  val_RMSE={val_rmse:.6e}"
         )
+
+        # --- Early stopping check ---
+        improved = (val_mse + es_min_delta) < best_val
+        if improved:
+            best_val = val_mse
+            no_improve = 0
+            if es_restore_best:
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            no_improve += 1
+            if early_stopping and no_improve >= es_patience:
+                print(f"[ES] Early stopping at epoch {epoch} (best val_MSE={best_val:.6e})")
+                if es_restore_best and best_state is not None:
+                    model.load_state_dict(best_state)
+                    print("[ES] Restored best model weights")
+                break
 
     return model, hist

@@ -3,12 +3,12 @@ import glob
 import subprocess
 
 # --- CONFIGURATION ---
-BASE_DIR = '/data3/sauravmitra/ML_CFD_PINN/Gasifier'  # Update this to your base folder
+BASE_DIR = '/data3/sauravmitra/ML_CFD_PINN/BVR-Kuipers-ROM'  # Update this to your base folder
 SCRIPT_NAME = 'convert_cells_to_npy.py'              # Make sure this is the correct filename
 
 # --- MAIN ---
 def main():
-    rev_dirs = sorted(glob.glob(os.path.join(BASE_DIR, 'Rev6')))
+    rev_dirs = sorted(glob.glob(os.path.join(BASE_DIR, 'Rev*')))
 
     if not rev_dirs:
         print(f"[ERROR] No Rev* folders found under {BASE_DIR}")
