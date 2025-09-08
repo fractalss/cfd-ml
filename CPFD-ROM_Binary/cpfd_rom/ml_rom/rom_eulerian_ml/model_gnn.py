@@ -1,5 +1,5 @@
 # Saurav Mitra
-# model_gnn.py  (XYZ(+time)+param -> field)
+# model_gnn.py  (XYZ(+time)+param[+baseline] -> field)
 from __future__ import annotations
 import math
 import numpy as np
@@ -19,7 +19,6 @@ __all__ = [
     "build_node_features_xyz",
     "train_gcn_model",
     "laplacian_smoothness",
-    "predict_gcn",
 ]
 
 # ---------------------------------
@@ -53,7 +52,7 @@ def _make_conv(kind: str, in_c: int, out_c: int, **kw):
 class ThreeLayerGCN(nn.Module):
     """A minimal 3-layer GNN for scalar field regression per node.
 
-    in_dim:  node feature dimension (XYZ [+ time features] [+ params])
+    in_dim:  node feature dimension (XYZ [+ time features] [+ params] [+ optional baseline channel])
     hidden:  hidden width for conv layers
     out_dim: number of target channels (default 1)
     dropout: dropout after conv1/conv2
@@ -71,6 +70,7 @@ class ThreeLayerGCN(nn.Module):
         **kw,
     ):
         super().__init__()
+        self.in_dim = int(in_dim)
         self.conv1 = _make_conv(conv_type, in_dim, hidden, **kw)
         self.conv2 = _make_conv(conv_type, hidden, hidden, **kw)
         self.conv3 = _make_conv(conv_type, hidden, out_dim, **kw)
@@ -170,7 +170,7 @@ def _time_block_for(
 
 
 # ---------------------------------
-# Training (graph fixed; features = XYZ(+time)+param ; targets = field)
+# Training (graph fixed; features = XYZ(+time)+param [+ baseline] ; targets = field)
 # ---------------------------------
 
 def _broadcast_params(params_row: np.ndarray, N: int, device, dtype) -> torch.Tensor:
@@ -198,22 +198,36 @@ def _concat_features(
     t_sigma: Optional[float] = None,
     fourier_m: int = 4,
     time_gain: float = 1.0,
+    extra_node_chan: Optional[torch.Tensor] = None,  # (N, C_extra) e.g., baseline channel
 ) -> torch.Tensor:
     """
     Build per-node features:
-      [ X_node (N,F_node) | broadcast(params) (N,P) | (optional) time block (N,T) ]
+      [ X_node (N,F_node) | broadcast(params) (N,P) | (optional) time block (N,T) | (optional) extra_node_chan ]
     """
     N = X_node.size(0)
     dtype = X_node.dtype
+    feats = [X_node]
+
+    # Optional extra per-node channel(s), e.g. baseline (current snapshot)
+    if extra_node_chan is not None:
+        if extra_node_chan.dim() == 1:
+            extra_node_chan = extra_node_chan.view(-1, 1)
+        if extra_node_chan.size(0) != N:
+            raise ValueError("extra_node_chan must have N rows to match X_node")
+        feats.append(extra_node_chan.to(X_node.device, dtype=dtype))
+
+    # Broadcasted params
     P_node = _broadcast_params(params_row, N, device, dtype)  # (N,P)
-    feats = [X_node, P_node]
+    feats.append(P_node)
+
+    # Optional time block
     if add_time and time_mode != "none" and time_val is not None:
         tb = _time_block_for(
             time_val, N, device, dtype, time_mode, t_min, t_max, t_mu, t_sigma, fourier_m
         )
         tb = tb * float(time_gain)
         feats.append(tb)
-    return torch.cat(feats, dim=1)  # (N, F_node+P+T)
+    return torch.cat(feats, dim=1)  # (N, F_node + C_extra + P + T)
 
 
 def laplacian_smoothness(pred: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
@@ -221,6 +235,23 @@ def laplacian_smoothness(pred: torch.Tensor, edge_index: torch.Tensor) -> torch.
     src, dst = edge_index
     diff = pred[src] - pred[dst]
     return (diff ** 2).mean()
+
+
+def _weighted_mse(
+    pred: torch.Tensor,  # (N,1)
+    target: torch.Tensor,  # (N,1)
+    node_weights: Optional[torch.Tensor] = None,  # (N,)
+) -> torch.Tensor:
+    """Compute MSE with optional per-node weights.
+    If node_weights is provided, return sum(w * err^2) / sum(w). Otherwise, mean(err^2).
+    """
+    err2 = (pred - target) ** 2  # (N,1)
+    if node_weights is not None:
+        w = node_weights.view(-1, 1)
+        num = (w * err2).sum()
+        den = w.sum().clamp_min(1e-12)
+        return num / den
+    return err2.mean()
 
 
 @torch.no_grad()
@@ -241,12 +272,20 @@ def _eval_set(
     t_sigma: Optional[float] = None,
     fourier_m: int = 4,
     time_gain: float = 1.0,
+    node_weights: Optional[torch.Tensor] = None,  # (N,)
+    sample_weights: Optional[np.ndarray] = None,  # (S,)
+    baseline_eval: Optional[np.ndarray] = None,  # (S, N) or (S,N,1) optional per-sample baseline channels
 ) -> float:
     model.eval()
-    loss_fn = nn.MSELoss()
 
     losses = []
     for s in range(Y.shape[0]):
+        extra = None
+        if baseline_eval is not None:
+            be = baseline_eval[s]
+            if be.ndim == 2 and be.shape[1] == 1:
+                be = be.reshape(-1)
+            extra = torch.from_numpy(be.astype(np.float32)).to(device).view(-1, 1)
         feats = _concat_features(
             X_node,
             P[s],
@@ -260,22 +299,45 @@ def _eval_set(
             t_sigma=t_sigma,
             fourier_m=fourier_m,
             time_gain=time_gain,
+            extra_node_chan=extra,
         )
+        # Defensive check against feature-width drift
+        if hasattr(model, "in_dim") and feats.size(1) != model.in_dim:
+            raise RuntimeError(
+                f"[VAL] Feature width {feats.size(1)} != model.in_dim {model.in_dim}. "
+                f"(extra={'yes' if extra is not None else 'no'}, P={P.shape[1]}, "
+                f"time_dim={_time_feature_dim(time_mode, fourier_m) if add_time else 0})"
+            )
         y_true = torch.from_numpy(Y[s].astype(np.float32)).to(device).reshape(-1, 1)
         y_pred = model(feats, edge_index)
-        losses.append(loss_fn(y_pred, y_true).item())
+        loss = _weighted_mse(y_pred, y_true, node_weights)
+        if sample_weights is not None:
+            loss = loss * float(sample_weights[s])
+        losses.append(loss.item())
+    # average over samples (already weighted by sample_weights above)
     return float(np.mean(losses)) if losses else float("nan")
+
+
+def _squeeze_baseline_arr(arr: Optional[np.ndarray], N: int) -> Optional[np.ndarray]:
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if a.ndim == 3 and a.shape[2] == 1:
+        a = a[:, :, 0]
+    if a.ndim != 2 or a.shape[1] != N:
+        raise ValueError(f"baseline array must be (S,N) or (S,N,1); got {arr.shape}")
+    return a
 
 
 def train_gcn_model(
     Y_train: np.ndarray,  # (S_train, N)   targets (field)
-    Y_test: np.ndarray,  # (S_val,   N)   targets (field)
+    Y_val: np.ndarray,    # (S_val,   N)   targets (field)
     P_train: np.ndarray,  # (S_train, P)
-    P_test: np.ndarray,  # (S_val,   P)
+    P_val: np.ndarray,    # (S_val,   P)
     edge_index: np.ndarray | torch.Tensor,
     *,
     # Static node features (xyz standardized)  pass as np.ndarray or torch.Tensor
-    X_node: TensorLike | None = None,  # (N, F_node), if None you must build in pipeline and pass tensor there
+    X_node: TensorLike | None = None,  # (N, F_node)
     # Optimization
     epochs: int = 50,
     lr: float = 1e-3,
@@ -283,8 +345,8 @@ def train_gcn_model(
     dropout: float = 0.1,
     lambda_smooth: float = 0.0,
     device: Optional[str] = None,
-    shuffle: bool = True,  # <--- NEW
-    shuffle_seed: Optional[int] = None,  # <--- NEW
+    shuffle: bool = True,
+    shuffle_seed: Optional[int] = None,
     # Optional time conditioning
     add_time: bool = False,
     times_train: Optional[np.ndarray] = None,
@@ -294,24 +356,36 @@ def train_gcn_model(
     time_gain: float = 1.0,
     # Data pruning
     ignore_head_frac: float = 0.0,
+    # --- NEW: weighting ---
+    node_weights: Optional[np.ndarray] = None,  # (N,)
+    sample_weights: Optional[np.ndarray] = None,  # (S_train,)
+    # --- NEW: optional baseline channel per sample ---
+    baseline_train: Optional[np.ndarray] = None,  # (S_train, N) or (S_train,N,1)
+    baseline_val: Optional[np.ndarray] = None,    # (S_val,   N) or (S_val,  N,1)
     **kw,
 ) -> Tuple[nn.Module, Dict[str, list]]:
     """
     Graph-first training:
-      inputs = [X_node | params | (time?)]  --> predict field
-      targets = Y_* (field)
+      inputs = [X_node | (baseline?) | params | (time?)]  --> predict field (residual or full)
 
     Parameters:
       ignore_head_frac : float in [0,1)
           If > 0, drop the first fraction of TRAIN snapshots (by current order in
           Y_train/P_train/times_train) before training. This does not touch validation.
           Useful to exclude early transients from model fitting.
+      node_weights : per-node weights (N,) applied to the MSE reduction.
+      sample_weights : optional per-snapshot weights (S_train,). If provided, the
+          per-snapshot loss is multiplied by sample_weights[s] before averaging
+          across snapshots each epoch.
+      baseline_* : optional per-sample baseline channels (S, N) or (S,N,1). If provided, one
+          scalar channel per node will be concatenated to the input features.
     """
-    assert Y_train.ndim == 2 and Y_test.ndim == 2, "Y_* must be (S, N)"
-    assert P_train.ndim == 2 and P_test.ndim == 2, "P_* must be (S, P)"
+    assert Y_train.ndim == 2 and Y_val.ndim == 2, "Y_* must be (S, N)"
+    assert P_train.ndim == 2 and P_val.ndim == 2, "P_* must be (S, P)"
     assert (
-        Y_train.shape[0] == P_train.shape[0] and Y_test.shape[0] == P_test.shape[0]
+        Y_train.shape[0] == P_train.shape[0] and Y_val.shape[0] == P_val.shape[0]
     ), "Snapshot count mismatch"
+
     # --- Optionally drop the first fraction of training snapshots ---
     if ignore_head_frac and float(ignore_head_frac) > 0.0:
         S0 = int(Y_train.shape[0])
@@ -321,6 +395,10 @@ def train_gcn_model(
             P_train = P_train[k:]
             if times_train is not None:
                 times_train = times_train[k:]
+            if sample_weights is not None and len(sample_weights) == S0:
+                sample_weights = sample_weights[k:]
+            if baseline_train is not None and baseline_train.shape[0] == S0:
+                baseline_train = baseline_train[k:]
             print(f"[PRUNE] Ignored first {k}/{S0} (~{(100.0*k/max(1,S0)):.1f}%) training snapshots (ignore_head_frac={ignore_head_frac}).")
 
     if device is None:
@@ -349,16 +427,38 @@ def train_gcn_model(
     if X_node.shape[0] != N:
         raise ValueError(f"X_node has N={X_node.shape[0]} but targets have N={N}")
 
+    # Normalize baseline array shapes to (S,N)
+    baseline_train = _squeeze_baseline_arr(baseline_train, N)
+    baseline_val   = _squeeze_baseline_arr(baseline_val, N)
+
+    # Determine extra feature dims (baseline channel)
+    extra_dim = 1 if baseline_train is not None else 0
+
     t_feat_dim = _time_feature_dim(time_mode, fourier_m) if add_time else 0
-    in_dim = X_node.shape[1] + param_dim + t_feat_dim
+    in_dim = X_node.shape[1] + extra_dim + param_dim + t_feat_dim
 
     model = build_gcn_model(in_dim=in_dim, hidden=hidden, out_dim=1, dropout=dropout, **kw).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+
+    # convert weights to tensors on device
+    node_w_t = None
+    if node_weights is not None:
+        if isinstance(node_weights, np.ndarray):
+            node_w_t = torch.from_numpy(node_weights.astype(np.float32)).to(dev)
+        else:
+            node_w_t = node_weights.to(dev, dtype=torch.float32)
+        if node_w_t.numel() != N:
+            raise ValueError(f"node_weights length {node_w_t.numel()} does not match N={N}")
+
+    sample_w = None
+    if sample_weights is not None:
+        sample_w = np.asarray(sample_weights, dtype=np.float32)
+        if sample_w.shape[0] != Y_train.shape[0]:
+            raise ValueError("sample_weights must have length S_train")
 
     # --- Early stopping config (from kwargs / pipeline) ---
     early_stopping = bool(kw.pop("early_stopping", True))
-    es_patience = int(kw.pop("es_patience", 20))
+    es_patience = int(kw.pop("es_patience", 30))
     es_min_delta = float(kw.pop("es_min_delta", 0.0))
     es_restore_best = bool(kw.pop("es_restore_best", True))
 
@@ -377,21 +477,25 @@ def train_gcn_model(
     best_val = float("inf")
     best_state = None
     no_improve = 0
-    # --- NEW: reproducible RNG for shuffling ---
+    # --- RNG for shuffling ---
     if shuffle_seed is not None:
         np.random.seed(int(shuffle_seed))
         torch.manual_seed(int(shuffle_seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(shuffle_seed))
+    print(f"[DBG] TRAIN Y mean/std {Y_train.mean():.3e}/{Y_train.std():.3e} | "
+          f"VAL Y mean/std {Y_val.mean():.3e}/{Y_val.std():.3e}")
 
     for epoch in range(1, epochs + 1):
         model.train()
 
         order = np.random.permutation(Y_train.shape[0]) if shuffle else np.arange(Y_train.shape[0])
 
-        epoch_loss = 0.0
-
-        for s in order:
+        epoch_losses = []
+        for idx, s in enumerate(order):
+            extra = None
+            if baseline_train is not None:
+                extra = torch.from_numpy(baseline_train[s].astype(np.float32)).to(dev).view(-1, 1)
             feats = _concat_features(
                 X_node,
                 P_train[s],
@@ -405,23 +509,34 @@ def train_gcn_model(
                 t_sigma=t_sigma,
                 fourier_m=fourier_m,
                 time_gain=time_gain,
+                extra_node_chan=extra,
             )
+            # Guard against feature-width drift
+            if hasattr(model, "in_dim") and feats.size(1) != model.in_dim:
+                raise RuntimeError(
+                    f"[TRAIN] Feature width {feats.size(1)} != model.in_dim {model.in_dim}. "
+                    f"(extra={'yes' if extra is not None else 'no'}, P={P_train.shape[1]}, "
+                    f"time_dim={_time_feature_dim(time_mode, fourier_m) if add_time else 0})"
+                )
+
             y_true = torch.from_numpy(Y_train[s].astype(np.float32)).to(dev).reshape(-1, 1)
 
             opt.zero_grad(set_to_none=True)
             y_pred = model(feats, ei)
-            mse = loss_fn(y_pred, y_true)
+            mse = _weighted_mse(y_pred, y_true, node_w_t)
             reg = laplacian_smoothness(y_pred, ei) * lambda_smooth if lambda_smooth > 0 else 0.0
             loss = mse + (reg if isinstance(reg, torch.Tensor) else torch.tensor(reg, device=dev, dtype=y_pred.dtype))
+            if sample_w is not None:
+                loss = loss * float(sample_w[s])
             loss.backward()
             opt.step()
-            epoch_loss += mse.item()
+            epoch_losses.append(mse.detach().item())
 
-        train_mse = epoch_loss / max(1, Y_train.shape[0])
+        train_mse = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         val_mse = _eval_set(
             model,
-            Y_test,
-            P_test,
+            Y_val,
+            P_val,
             X_node,
             ei,
             dev,
@@ -434,6 +549,9 @@ def train_gcn_model(
             t_sigma=t_sigma,
             fourier_m=fourier_m,
             time_gain=time_gain,
+            node_weights=node_w_t,
+            sample_weights=None,
+            baseline_eval=baseline_val,
         )
         val_rmse = math.sqrt(val_mse) if val_mse == val_mse else float("nan")  # guard NaN
 

@@ -1,5 +1,5 @@
 # Saurav Mitra
-# inference.py  GCN inference helpers (XYZ(+time)+param -> field)
+# inference.py  GCN inference helpers (XYZ(+time)+param[+baseline]) -> field)
 from __future__ import annotations
 from typing import Optional, Union
 
@@ -33,6 +33,8 @@ def predict_gcn(
     t_sigma: Optional[float] = None,
     fourier_m: int = 4,
     time_gain: float = 1.0,
+    # NEW: optional per-node baseline channel used as an additional input feature
+    baseline_chan: Optional[Union[np.ndarray, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Return predicted field as a tensor shaped (N,).
 
@@ -46,33 +48,50 @@ def predict_gcn(
         time_mode: "none" | "scalar" | "fourier".
         t_min, t_max, t_mu, t_sigma, fourier_m: Same statistics/settings used in training.
         time_gain: Scalar multiplier applied to the time feature block to increase its weight.
+        baseline_chan: Optional (N,) or (N,1) array/tensor of baseline field values to use as an
+            extra input feature channel.
 
     Notes:
         Ensure the same preprocessing used during training (XYZ standardization, parameter vector,
-        and time-feature configuration) is applied here for consistency.
+        time-feature configuration, and optional baseline channel) is applied here for consistency.
     """
     device = next(model.parameters()).device
 
-    # Normalize inputs
+    # params -> numpy row
     if isinstance(params_row, torch.Tensor):
         pr_np = params_row.detach().cpu().numpy().reshape(-1)
     else:
         pr_np = np.asarray(params_row, dtype=np.float32).reshape(-1)
 
+    # X_node -> tensor
     if not isinstance(X_node, torch.Tensor):
         X_node = torch.as_tensor(X_node, dtype=torch.float32)
+
+    # If a baseline channel is provided, concatenate it as an extra feature column
+    base_dim = 0
+    if baseline_chan is not None:
+        if isinstance(baseline_chan, torch.Tensor):
+            b = baseline_chan.detach().cpu().float().reshape(-1, 1)
+        else:
+            b = torch.as_tensor(np.asarray(baseline_chan, dtype=np.float32).reshape(-1, 1))
+        if b.shape[0] != X_node.shape[0]:
+            raise ValueError(
+                f"predict_gcn(): baseline_chan length {b.shape[0]} != N {X_node.shape[0]}"
+            )
+        X_node = torch.cat([X_node, b], dim=1)
+        base_dim = 1
 
     # Optional: sanity check expected input dim vs model's first conv
     tdim = 0
     tm = (time_mode or "none").lower()
     if add_time and tm != "none":
         tdim = 1 if tm == "scalar" else 2 * max(1, int(fourier_m))
-    exp_in = int(X_node.shape[1]) + int(pr_np.size) + tdim
+    exp_in = int(X_node.shape[1]) + int(pr_np.size) + tdim  # X_node may include baseline column
     in_model = getattr(getattr(model, "conv1", None), "in_channels", None)
     if isinstance(in_model, int) and in_model > 0 and in_model != exp_in:
         raise ValueError(
             f"predict_gcn(): feature dim {exp_in} != model input {in_model}. "
-            f"Pass the same time_mode/fourier_m/time_gain used in training (got time_mode={tm}, fourier_m={fourier_m})."
+            f"Pass the same time_mode/fourier_m/time_gain and baseline feature flag used in training (time_mode={tm}, fourier_m={fourier_m}, baseline_dim={base_dim})."
         )
 
     feats = _concat_features(

@@ -55,37 +55,98 @@ def _df_to_nodes_df(df_ref: pd.DataFrame) -> pd.DataFrame:
     return nodes
 
 
-def _nodes_to_edge_index(nodes: pd.DataFrame, *, neighbor_set: str = 'n6', bidirectional: bool = True) -> np.ndarray:
-    """Wire ±1 neighbors in integer (i,j,k). Keeps input order as node_id order. Returns (2,E) int64."""
-    if not {'node_id', 'i', 'j', 'k'}.issubset(nodes.columns):
-        raise ValueError("nodes DataFrame must include columns ['node_id','i','j','k']")
+def _nodes_to_edge_index(
+    nodes: pd.DataFrame,
+    *,
+    neighbor_set: str = "n6",
+    bidirectional: bool = True,
+) -> np.ndarray:
+    """
+    Build a 2xE edge_index from nodes[['node_id','i','j','k']].
+    neighbor_set: 'n6' | 'n18' | 'n26'
+    - n6 : axis-aligned neighbors only (|di|+|dj|+|dk| == 1)
+    - n18: face + edge neighbors   (1 <= |di|+|dj|+|dk| <= 2)
+    - n26: include corners         (1 <= |di|+|dj|+|dk| <= 3)
+    """
+    required = {"node_id", "i", "j", "k"}
+    if not required.issubset(nodes.columns):
+        raise ValueError(f"nodes must have columns {required}")
 
-    if neighbor_set == 'n6':
-        deltas = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
-    elif neighbor_set == 'n18':
-        base = [-1,0,1]
-        deltas = [(di,dj,dk) for di in base for dj in base for dk in base if (abs(di)+abs(dj)+abs(dk) in (1,2)) and not (di==dj==dk==0)]
-    elif neighbor_set == 'n26':
-        base = [-1,0,1]
-        deltas = [(di,dj,dk) for di in base for dj in base for dk in base if not (di==dj==dk==0)]
+    # Build a dictionary (i,j,k) -> node_id for O(1) neighbor lookup
+    triplets = list(zip(nodes["i"].to_numpy(), nodes["j"].to_numpy(), nodes["k"].to_numpy()))
+    ids      = nodes["node_id"].to_numpy()
+    lut = {ijk: nid for ijk, nid in zip(triplets, ids)}
+
+    # Offsets by neighbor set
+    offsets = []
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            for dk in (-1, 0, 1):
+                if di == 0 and dj == 0 and dk == 0:
+                    continue
+                manhattan = abs(di) + abs(dj) + abs(dk)
+                if neighbor_set == "n6":
+                    if manhattan == 1:
+                        offsets.append((di, dj, dk))
+                elif neighbor_set == "n18":
+                    if 1 <= manhattan <= 2:
+                        offsets.append((di, dj, dk))
+                elif neighbor_set == "n26":
+                    if 1 <= manhattan <= 3:
+                        offsets.append((di, dj, dk))
+                else:
+                    raise ValueError(f"Unknown neighbor_set={neighbor_set}")
+
+    # Build edges without duplicates
+    edges = set()
+    for (i, j, k), src in zip(triplets, ids):
+        for di, dj, dk in offsets:
+            nb = (i + di, j + dj, k + dk)
+            dst = lut.get(nb)
+            if dst is None:
+                continue
+            if bidirectional:
+                # For undirected logic, store canonical pair once; later expand to both directions
+                a, b = (src, dst) if src <= dst else (dst, src)
+                edges.add((a, b))
+            else:
+                edges.add((src, dst))
+
+    if bidirectional:
+        dir_edges = []
+        for a, b in edges:
+            if a == b:
+                continue
+            dir_edges.append((a, b))
+            dir_edges.append((b, a))
+        arr = np.asarray(dir_edges, dtype=np.int64).T  # shape (2, E)
     else:
-        raise ValueError("neighbor_set must be one of {'n6','n18','n26'}")
+        arr = np.asarray(list(edges), dtype=np.int64).T if edges else np.empty((2,0), dtype=np.int64)
 
-    idx = {(int(r.i), int(r.j), int(r.k)): int(r.node_id) for r in nodes.itertuples(index=False)}
-    src_list, dst_list = [], []
+    # Integrity checks (only for n6 enforce exact Manhattan distance = 1)
+    if neighbor_set == "n6":
+        inv = np.empty(len(nodes), dtype=np.int64)
+        inv[nodes["node_id"].to_numpy()] = np.arange(len(nodes))
+        ijk_arr = nodes[["i","j","k"]].to_numpy()
+        if arr.size:
+            s = inv[arr[0]]
+            d = inv[arr[1]]
+            diffs = np.abs(ijk_arr[s] - ijk_arr[d])
+            manhattan = diffs.sum(axis=1)
+            if not np.all(manhattan == 1):
+                bad = np.where(manhattan != 1)[0][:10]
+                print(f"[EDGECHK] WARNING: found {bad.size} non-n6 edges (showing up to 10). Examples manhattan={manhattan[bad]}")
+        else:
+            print("[EDGECHK] No edges generated.")
 
-    for r in tqdm(nodes.itertuples(index=False), total=len(nodes), desc=f"Edges: wiring {neighbor_set}"):
-        i, j, k = int(r.i), int(r.j), int(r.k)
-        u = int(r.node_id)
-        for di, dj, dk in deltas:
-            v = idx.get((i+di, j+dj, k+dk))
-            if v is not None:
-                src_list.append(u); dst_list.append(v)
-                if bidirectional and v != u:
-                    src_list.append(v); dst_list.append(u)
+    # Quick stats
+    if arr.size:
+        N = len(nodes)
+        E = arr.shape[1]
+        avg_outdeg = E / N
+        print(f"[EDGESTATS] N={N} directed E={E} avg_out-degree={avg_outdeg:.2f} (bidirectional={bidirectional}, neighbor_set={neighbor_set})")
+    return arr
 
-    edge_index = np.vstack([np.asarray(src_list, dtype=np.int64), np.asarray(dst_list, dtype=np.int64)])
-    return edge_index
 
 
 def _build_nodes_and_edges(df_ref: pd.DataFrame, out_dir: Path, edge_bidir: bool = True, *, neighbor_set: str = 'n6'):
