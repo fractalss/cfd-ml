@@ -7,11 +7,11 @@ Description-Content-Type: text/markdown
 Requires-Dist: numpy
 Requires-Dist: pandas
 Requires-Dist: scikit-learn
-Requires-Dist: tensorflow
 Requires-Dist: torch
 Requires-Dist: matplotlib
 Requires-Dist: pyyaml
-Requires-Dist: absl-py
+Requires-Dist: torch_geometric
+Requires-Dist: tqdm
 Dynamic: author
 Dynamic: description
 Dynamic: description-content-type

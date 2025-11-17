@@ -3,16 +3,16 @@ from setuptools import setup, find_packages
 setup(
     name="cpfd_rom",
     version="0.2",
-    packages=find_packages(include=["cpfd_rom", "ml_rom", "pca_rbf_rom", "util"]),
+    packages=find_packages(include=["cpfd_rom", "cpfd_rom.*"]),
     install_requires=[
         "numpy",
         "pandas",
         "scikit-learn",
-        "tensorflow",
         "torch",
         "matplotlib",
         "pyyaml",
-        "absl-py"
+        "torch_geometric",
+        "tqdm",
     ],
     entry_points={
         "console_scripts": [

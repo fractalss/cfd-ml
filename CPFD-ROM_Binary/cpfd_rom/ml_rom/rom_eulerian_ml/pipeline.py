@@ -456,7 +456,7 @@ def run_ml_rom_pipeline(cfg, log_time):
                 P_val_n,
                 edge_index,
                 X_node=X_node,
-                epochs=int(getattr(cfg, "epochs", 300)),
+                epochs=int(getattr(cfg, "epochs", 10)),
                 lr=float(getattr(cfg, "lr", 1e-3)),
                 hidden=int(getattr(cfg, "hidden", 256)),
                 dropout=float(getattr(cfg, "dropout", 0.0)),
