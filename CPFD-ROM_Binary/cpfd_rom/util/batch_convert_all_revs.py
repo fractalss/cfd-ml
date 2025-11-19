@@ -3,10 +3,9 @@ import glob
 import subprocess
 
 # --- CONFIGURATION ---
-BASE_DIR = '/data3/sauravmitra/ML_CFD_PINN/Gasifier'  # Update if needed
-FIELD_VARIABLE = 'Particle volume fraction'           # Change if needed
-
-# --- MAIN ---
+BASE_DIR = '/data3/sauravmitra/ML_CFD_PINN/BVR-Kuipers-ROM'  # Update if needed
+SCRIPT_NAME = 'convert_particles_to_npy.py'
+# --- MAIN SCRIPT_NAME = 'convert_cells_to_npy.py'  ---
 def main():
     rev_dirs = sorted(glob.glob(os.path.join(BASE_DIR, 'Rev*')))
 
@@ -23,10 +22,9 @@ def main():
 
         cmd = [
             'python',
-            'convert_particles_to_npy.py',
+            SCRIPT_NAME,
             '--input_dir', rev_dir,
-            '--output_dir', output_dir,
-            '--field_variable', FIELD_VARIABLE
+            '--output_dir', output_dir
             # No --header_lines needed, as the new script infers from parse_file_metadata
         ]
 

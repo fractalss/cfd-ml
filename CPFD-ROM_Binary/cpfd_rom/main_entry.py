@@ -8,7 +8,7 @@ import argparse
 from cpfd_rom.util.config import load_config, overlay_cli
 from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import run_ml_rom_pipeline
 from cpfd_rom.pca_rbf_rom.rom_eulerian_pca_rbf.pipeline import run_eulerian_pca_rbf_pipeline
-# from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
+from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
 # from cpfd_rom.pca_rbf_rom.rom_lagrangian_pca_rbf.pipeline import run_lagrangian_pca_rbf_pipeline
 
 
@@ -96,7 +96,7 @@ def main():
     if cfg.rom_type == "ML" and cfg.type_of_field == "Eulerian":
         run_ml_rom_pipeline(cfg, log_time)
     elif cfg.rom_type == "ML" and cfg.type_of_field == "Lagrangian":
-        # run_lagrangian_ml_pipeline(cfg, log_time)
+        run_lagrangian_ml_pipeline(cfg, log_time)
         raise NotImplementedError("Lagrangian ML pipeline is not wired in this entry point.")
     elif cfg.rom_type == "PCA-RBF" and cfg.type_of_field == "Eulerian":
         run_eulerian_pca_rbf_pipeline(cfg, log_time)
