@@ -97,7 +97,7 @@ def main():
         run_ml_rom_pipeline(cfg, log_time)
     elif cfg.rom_type == "ML" and cfg.type_of_field == "Lagrangian":
         run_lagrangian_ml_pipeline(cfg, log_time)
-        raise NotImplementedError("Lagrangian ML pipeline is not wired in this entry point.")
+
     elif cfg.rom_type == "PCA-RBF" and cfg.type_of_field == "Eulerian":
         run_eulerian_pca_rbf_pipeline(cfg, log_time)
     elif cfg.rom_type == "PCA-RBF" and cfg.type_of_field == "Lagrangian":
