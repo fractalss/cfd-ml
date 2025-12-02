@@ -319,6 +319,27 @@ def run_lagrangian_ml_pipeline(config, log_time):
             infer_scaled = flat_inf_scaled.reshape(infer_data.shape)
 
         # Torch inference in batches
+        # Build parameter array for inference if available
+        param_mapping = getattr(config, "param_mapping", None)
+        params_infer = None
+        if param_mapping is not None:
+            if trained_here:
+                # Reuse params_all from training if available; otherwise rebuild
+                if "params_all" in locals() and params_all is not None:
+                    params_infer = params_all
+                else:
+                    params_infer = build_params_from_rev_dirs(infer_dirs, param_mapping)
+            else:
+                # skip_training path: build params for inference rev_dirs
+                params_infer = build_params_from_rev_dirs(infer_dirs, param_mapping)
+
+            if params_infer.shape[0] != s_inf:
+                raise ValueError(
+                    f"params_infer has {params_infer.shape[0]} entries but "
+                    f"infer_scaled has {s_inf} snapshots"
+                )
+
+
         model.eval()
         infer_batch_size = getattr(
             config, "infer_batch_size", getattr(config, "batch_size", 2)
@@ -327,10 +348,20 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
         with torch.no_grad():
             x_all = torch.from_numpy(infer_scaled).float().to(device)  # [S, N, 6]
+            if params_infer is not None:
+                p_all = torch.from_numpy(params_infer).float().to(device)  # [S, P]
+            else:
+                p_all = None
+
             for b_start in range(0, s_inf, infer_batch_size):
                 x_b = x_all[b_start : b_start + infer_batch_size]       # [B, N, 6]
-                recon_b, _ = model(x_b)                                # recon_b: [B, N, 4]
+                if p_all is not None:
+                    p_b = p_all[b_start : b_start + infer_batch_size]  # [B, P]
+                    recon_b, _ = model(x_b, p_b)                       # recon_b: [B, N, 4]
+                else:
+                    recon_b, _ = model(x_b)                            # recon_b: [B, N, 4]
                 preds_scaled_list.append(recon_b.cpu().numpy())
+
 
         preds_scaled = np.concatenate(preds_scaled_list, axis=0)       # [S, N, 4]
 
@@ -364,16 +395,23 @@ def run_lagrangian_ml_pipeline(config, log_time):
                     "[Lagrangian] enforce_geometry=True but geometry_stl_path is not set."
                 )
 
+            print(f"[INFO] Loading STL geometry: {stl_path}")
             projector = GeometryProjector(stl_path)
+            print("[INFO] STL loaded. Beginning geometry projection...")
+
+            from tqdm import tqdm
 
             # Flatten over snapshots for projection, then reshape back
             s_inf, n_points_inf, _ = pred_array.shape
-            xyz = pred_array[..., :3].reshape(-1, 3)  # (S*N, 3)
 
-            print("[INFO] Projecting predicted particle coordinates into geometry...")
-            xyz_proj = projector.project_points_inside(xyz)
 
-            pred_array[..., 0:3] = xyz_proj.reshape(s_inf, n_points_inf, 3)
+            print("[INFO] Projecting predicted particle coordinates into geometry volume...")
+
+            print("[INFO] Projecting predicted particle coordinates into geometry volume...")
+            for s in tqdm(range(s_inf), desc="Geometry projection (snapshots)", unit="snap"):
+                xyz = pred_array[s, :, 0:3]  # (N_points, 3)
+                xyz_proj = projector.project_points_inside(xyz)  # vectorized over N
+                pred_array[s, :, 0:3] = xyz_proj
         # Use the first rev_dir as the schema source (columns.txt).
         # Assumes all Rev*_npy have the same columns, which they should.
         columns_dir = Path(config.rev_dirs[0])

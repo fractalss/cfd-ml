@@ -66,3 +66,24 @@ class GeometryProjector:
             xyz_proj[outside_idx] = nearest_pts_adj
 
         return xyz_proj
+
+
+    def project(self, p: np.ndarray) -> np.ndarray:
+        """
+        Project a single point into the STL-defined volume.
+        Thin wrapper over project_points_inside for a single (3,) vector.
+        """
+        p = np.asarray(p, dtype=float).reshape(1, 3)
+        return self.project_points_inside(p)[0]
+
+    def project_points(self, xyz: np.ndarray) -> np.ndarray:
+        """Vectorised projection for an array of points.
+
+        This is a thin wrapper around :meth:`project_points_inside` and
+        does **not** loop per-point in Python. It expects ``xyz`` to be
+        of shape (M, 3) and returns an array of the same shape.
+        """
+        xyz = np.asarray(xyz, dtype=float)
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            raise ValueError(f"xyz must be (M, 3), got {xyz.shape}")
+        return self.project_points_inside(xyz)

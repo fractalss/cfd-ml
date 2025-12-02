@@ -54,23 +54,49 @@ class PointNetEncoder(nn.Module):
         )
 
     def forward(self, x, mask=None):
+        """Encode a point cloud batch.
+
+        Args:
+            x:    [B, N, C]  (C = in_dim)
+            mask: [B, N] or [B, 1, N] or None. If provided, marks valid points.
+                  Non-zero / True = valid, 0 / False = invalid.
+        Returns:
+            z:    [B, latent_dim]
+            feat: [B, N, point_feat_dim]
         """
-        x:    [B, N, C]  (C = in_dim)
-        mask: [B, N] or None. If provided, mask out invalid points.
-        """
-        # [B, N, C] ? [B, C, N]
+        # [B, N, C] -> [B, C, N]
         x = x.transpose(1, 2)
 
-        # Shared MLP ? per-point features [B, F, N]
+        # Shared MLP -> per-point features [B, F, N]
         feat = self.mlp(x)
 
         # Global max pooling over points (mask-aware if provided)
         if mask is None:
+            # Simple global max over all points
             global_feat, _ = torch.max(feat, dim=2)  # [B, F]
         else:
-            m = mask.unsqueeze(1).expand_as(feat)    # [B, F, N]
-            feat_masked = feat.masked_fill(~m, float('-inf'))
-            global_feat, _ = torch.max(feat_masked, dim=2)
+            # Ensure boolean mask regardless of input dtype (float/int/bool)
+            m = mask.bool()
+
+            # Accept [B, N] or [B, 1, N]
+            if m.dim() == 2:
+                # [B, N] -> [B, 1, N]
+                m = m.unsqueeze(1)
+            elif m.dim() == 3 and m.shape[1] != 1 and m.shape[1] != feat.shape[1]:
+                # If mask has incompatible channel dimension, squeeze it if possible
+                # to [B, 1, N] and broadcast later.
+                if m.shape[1] == feat.shape[2]:
+                    # probably [B, N, N] by mistake; take diagonal-like along last dim
+                    m = m[:, 0:1, :]
+                else:
+                    m = m[:, :1, :]
+
+            # Broadcast mask across feature channels: [B, 1, N] -> [B, F, N]
+            m = m.expand_as(feat)
+
+            # Mask out invalid points before max-pooling
+            feat_masked = feat.masked_fill(~m, float("-inf"))
+            global_feat, _ = torch.max(feat_masked, dim=2)  # [B, F]
 
         z = self.fc(global_feat)                    # [B, latent_dim]
 
