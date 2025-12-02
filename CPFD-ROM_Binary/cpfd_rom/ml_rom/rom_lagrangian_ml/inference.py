@@ -6,47 +6,34 @@ from torch.utils.data import DataLoader
 
 from .datasets import SnapshotDataset
 
+def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None, scaler=None):
+    """
+    Run inference on scaled Lagrangian data using the PointNet autoencoder.
 
-def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None):
-    """Run inference on scaled Lagrangian data using the PointNet autoencoder.
+     Input x has 6 features: [x, y, z, field, CloudID, CloudID_base]
+      Only the first 4 channels are used for prediction.
 
-    This helper is aligned with the current Lagrangian ROM logic:
-
-     Per-point scaled input x has 6 features:
-        [x, y, z, field, CloudID, CloudID_base]
-
-      where only the first 4 channels are dynamically scaled with
-      StandardScaler and used as prediction targets. The last 2 are
-      static IDs carried through in the pipeline (not predicted).
-
-     The PointNetAutoencoder is configured with out_dim = 4, so the
-      reconstructed output `recon` has shape [B, N, 4] corresponding to
-      [x, y, z, field] in scaled space.
+     Output recon has shape [B, N, 6]: [x, y, z, field, CloudID, CloudID_base]
 
     Parameters
     ----------
     model : torch.nn.Module
-        A PointNetAutoencoder configured with in_dim=6, out_dim=4.
+        A PointNetAutoencoder with in_dim=6, out_dim=4.
     data_scaled : np.ndarray
-        Scaled input data of shape [num_snaps, n_points, 6].
+        Scaled input of shape [num_snaps, n_points, 6].
     device : torch.device
-        Device on which to run inference.
-    batch_size : int, optional
-        Batch size for the DataLoader.
-    params : np.ndarray or None, optional
-        Optional array of shape [num_snaps, param_dim] providing
-        conditioning parameters per snapshot. If provided, they will
-        be batched in sync with the snapshots and passed to the model
-        as `params`.
+        PyTorch device.
+    batch_size : int
+        Batch size.
+    params : np.ndarray or None
+        Optional [num_snaps, param_dim] array for conditioning.
+    scaler : StandardScaler or None
+        Scaler fitted on training data (for inverse_transform and clipping).
 
     Returns
     -------
-    preds : np.ndarray
-        Reconstructed dynamic fields with shape [num_snaps, n_points, 4]
-        in scaled space corresponding to [x, y, z, field]. It is the
-        caller's responsibility to inverse-transform these 4 channels
-        with the StandardScaler and to append the static IDs from the
-        original data if needed for ROM file writing.
+    final_output : np.ndarray
+        Reconstructed [x, y, z, field, CloudID, CloudID_base] of shape [num_snaps, n_points, 6].
     """
     model.eval()
     dataset = SnapshotDataset(data_scaled)
@@ -55,7 +42,6 @@ def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None
     preds = []
     with torch.no_grad():
         for i, batch in enumerate(loader):
-            # batch: [B, N, 6]
             x = batch.to(device)
 
             if params is not None:
@@ -68,8 +54,21 @@ def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None
             recon, _ = model(x, params=p_batch)  # recon: [B, N, 4]
             preds.append(recon.cpu().numpy())
 
-    preds = np.concatenate(preds, axis=0)
-    return preds  # [num_snaps, n_points, 4]
+    preds = np.concatenate(preds, axis=0)  # [S, N, 4]
+
+    if scaler is not None:
+        flat = preds.reshape(-1, 4)
+        preds_inv = scaler.inverse_transform(flat).reshape(preds.shape)
+        # Clip each dynamic feature to training min/max
+        preds_clipped = np.clip(preds_inv, scaler.data_min_[:4], scaler.data_max_[:4])
+    else:
+        preds_clipped = preds
+
+    # Reattach CloudID and CloudID_base
+    cloud_ids = data_scaled[..., 4:6]
+    final_output = np.concatenate([preds_clipped, cloud_ids], axis=-1)  # [S, N, 6]
+
+    return final_output
 
 
 __all__ = ["predict_pointnet_torch"]

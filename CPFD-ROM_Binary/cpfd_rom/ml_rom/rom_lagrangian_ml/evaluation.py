@@ -15,14 +15,6 @@ __all__ = ["write_lagrangian_rom_only"]
 
 
 def _load_columns_from_dir(columns_dir: Path) -> list[str]:
-    """Load column names from columns.txt in a Rev*_npy directory.
-
-    We only use this to validate that the requested field variable name
-    exists in the original CPFD export, and to keep a loose connection
-    between ROM outputs and the original schema. The ROM itself operates
-    in a reduced 6-feature space and does not depend on the full set of
-    columns present in columns.txt.
-    """
     columns_dir = Path(columns_dir)
     columns_file = columns_dir / "columns.txt"
     if not columns_file.exists():
@@ -44,13 +36,15 @@ def write_lagrangian_rom_only(
     out_dir: Path = Path("."),
     zone_name: str = "Particles",
     field_var: str | None = None,
+    train_min: np.ndarray | None = None,
+    train_max: np.ndarray | None = None,
 ) -> None:
     """Write Lagrangian ROM snapshots to Tecplot-style particles*.txt files.
 
     This is aligned with the current Lagrangian ROM logic, where each
     per-point prediction has **6 features** in the ROM feature space:
 
-        [x, y, z, <field_variable>, CloudID, CloudID_base]
+        [x, y, z, field, CloudID, CloudID_base]
 
     The original CFD / npy data may have more columns (e.g., 11), but
     the pipeline has already selected and reassembled these 6 columns
@@ -59,7 +53,7 @@ def write_lagrangian_rom_only(
          trust `preds` as [S, P, 6]
          use columns.txt only to check that the field variable name
           exists in the original schema
-         write out exactly these 6 columns in the output text files.
+         write out reordered columns as: x, y, z, CloudID, CloudID_base, field
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -84,20 +78,18 @@ def write_lagrangian_rom_only(
             "[Lagrangian] field_var must be provided to write_lagrangian_rom_only."
         )
 
-    # Load authoritative column names from columns.txt (may be > 6)
     columns = _load_columns_from_dir(columns_dir)
-
-    # Ensure the field variable exists in the original schema for sanity.
     if field_var not in columns:
         raise ValueError(
             f"[Lagrangian] field_variable='{field_var}' not found in columns.txt. "
             f"Available columns: {columns}"
         )
 
-    # Header names for the 6 ROM columns we will write. These must match
-    # the internal ordering used in the pipeline when assembling preds.
-    header_cols = ["x", "y", "z", field_var, "CloudID", "CloudID_base"]
+    header_cols = ["x", "y", "z", "CloudID", "CloudID_base", field_var]
     header_md = [format_metadata(i + 1, name) for i, name in enumerate(header_cols)]
+
+    if train_min is not None and train_max is not None:
+        preds[..., :4] = np.clip(preds[..., :4], train_min[:4], train_max[:4])
 
     for s, t in enumerate(
         tqdm(times, desc="Writing Lagrangian ROM snapshots", unit="snap")
@@ -106,12 +98,20 @@ def write_lagrangian_rom_only(
         if snap.shape != (P, F):
             snap = snap.reshape(P, F)
 
-        # By construction, preds are already in the ROM feature order
-        # [x, y, z, field, CloudID, CloudID_base]. So we can just use
-        # them directly. If you ever change the internal ordering in the
-        # pipeline, update this section accordingly.
-        data_out = snap  # [P, 6]
-        df_out = pd.DataFrame(data_out, columns=header_cols)
+        # Rearrange columns to: x, y, z, CloudID, CloudID_base, field
+        reordered = np.stack(
+            [
+                snap[:, 0],  # x
+                snap[:, 1],  # y
+                snap[:, 2],  # z
+                snap[:, 4],  # CloudID
+                snap[:, 5],  # CloudID_base
+                snap[:, 3],  # field
+            ],
+            axis=-1,
+        )
+
+        df_out = pd.DataFrame(reordered, columns=header_cols)
 
         out_path = out_dir / f"particles_{float(t):09.3f}s.txt"
         with open(out_path, "w") as f:
