@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 
 import torch
 from pathlib import Path
+from tqdm import tqdm # Added for the geometry projection loop
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import load_lagrangian_snapshots
 from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import PointNetAutoencoder
@@ -18,12 +19,16 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import (
 )
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_torch
-# from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import predict_pointnet_torch  # optional
+# from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import predict_pointnet_torch # optional
 
 from cpfd_rom.util.output_utils import setup_output_dir
 from cpfd_rom.util.model_utils import setup_model_paths
 from cpfd_rom.ml_rom.rom_lagrangian_ml.geometry_projection import GeometryProjector
 from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
+from cpfd_rom.ml_rom.rom_lagrangian_ml.baseline_all4 import (
+    build_lagrangian_baseline_model_all4,
+    build_lagrangian_baseline_dyn_scaled_all4,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -175,18 +180,18 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
             # Select the 6 ROM features using columns.txt
             train_data = _select_rom_features(train_data_raw, config.rev_dirs, field_var)
-            n_snaps, n_points, n_features_total = train_data.shape  # n_features_total should now be 6
+            n_snaps, n_points, n_features_total = train_data.shape # n_features_total should now be 6
 
             # We will pass only the first 4 dynamic features into the network
             n_features_dyn = 4
 
             # Lock counts into config for downstream use
-            config.n_features_total = n_features_total   # 6
-            config.n_dynamic_features = n_features_dyn   # 4
+            config.n_features_total = n_features_total # 6
+            config.n_dynamic_features = n_features_dyn # 4
 
             # Standardize only the first 4 (dynamic) features: x, y, z, field
             scaler = StandardScaler()
-            flat = train_data.reshape(-1, n_features_total)  # [num_snaps * n_points, 6]
+            flat = train_data.reshape(-1, n_features_total) # [num_snaps * n_points, 6]
             flat_dyn = flat[:, :n_features_dyn]
             flat_ids = flat[:, n_features_dyn:]
 
@@ -194,11 +199,10 @@ def run_lagrangian_ml_pipeline(config, log_time):
             flat_scaled = np.concatenate([flat_dyn_scaled, flat_ids], axis=1)
             train_scaled = flat_scaled.reshape(train_data.shape)
 
-            # --------- Build param array if mapping is provided ---------
+            # --------- Build param array if mapping is provided (for training) ---------
             param_mapping = getattr(config, "param_mapping", None)
             params_all = None
             if param_mapping is not None:
-                print("[INFO] Building parameter array from rev_dirs + param_mapping...")
                 params_all = build_params_from_rev_dirs(config.rev_dirs, param_mapping)
                 if params_all.shape[0] != train_scaled.shape[0]:
                     raise ValueError(
@@ -225,7 +229,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 param_dim=param_dim,
             ).to(device)
 
-        # --------- Dataloaders ---------
+        # --------- Dataloaders and Training ---------
         with log_time("Creating DataLoaders and training model"):
             # Proper train/validation split
             if params_all is not None:
@@ -284,82 +288,54 @@ def run_lagrangian_ml_pipeline(config, log_time):
         try:
             model.eval()
             example_input = torch.randn(1, n_points, n_features_dyn, device=device)
-            scripted = torch.jit.trace(model, example_input)
+            # Check if param_dim > 0, if so, we need to trace with parameters
+            if param_dim > 0:
+                example_param = torch.randn(1, param_dim, device=device)
+                scripted = torch.jit.trace(model, (example_input, example_param))
+            else:
+                scripted = torch.jit.trace(model, example_input)
+
             script_path = model_path.replace(".pt", "_script.pt")
             scripted.save(script_path)
             print(f"[INFO] Saved TorchScript model to {script_path}")
         except Exception as e:
             print(f"[WARN] TorchScript export failed: {e}")
 
-        # Mark that we have just trained the model and have train_times/train_scaled in memory
+        # Mark that we have just trained the model and have train_times/train_scaled/train_data/flat_dyn/params_all in memory
         trained_here = True
+
+    # Ensure model is in evaluation mode for inference
+    model.eval()
 
     # --------------- Inference + ROM writing on rev_dirs ---------------
 
     # By default, inference uses the same rev_dirs as training.
-    # If you want to reconstruct only a subset of the training data
-    # (e.g., a single Rev with known snapshots per Rev), you can
-    # control this via config:
-    #
-    #   lagrangian_reconstruct_training_only: true
-    #   lagrangian_snaps_per_rev: 1001
-    #   lagrangian_reconstruct_rev_index: 0  # 0-based index among rev_dirs
-
     infer_dirs = config.rev_dirs
-    reconstruct_training_only = getattr(
-        config, "lagrangian_reconstruct_training_only", False
-    )
+    # The config 'lagrangian_reconstruct_training_only' and related logic is REMOVED.
+    # The logic will now proceed as if 'skip_training' is True, or use the *entire* training set for inference if trained_here=True.
 
     print("[INFO] Using rev_dirs for Lagrangian inference/ROM output.")
 
+    # --- Pre-allocate variables that may be defined in either branch (trained_here or not)
+    infer_times = None
+    infer_scaled = None
+    infer_data = None
+    s_inf = 0
+    n_points_inf = 0
+    n_features_inf_total = 0
+    # subset_slice is no longer needed since we removed the reconstruction subset logic
+    flat_inf_dyn = None # Needed for min/max clipping if skip_training=True
+
     with log_time("Running Lagrangian inference on rev_dirs"):
-        subset_slice = slice(None)  # default = use all snapshots
-
         if trained_here:
-            # We have train_times, train_scaled, train_data in memory from the
-            # training branch above. Optionally restrict to a single Rev.
-            if reconstruct_training_only:
-                snaps_per_rev = getattr(config, "lagrangian_snaps_per_rev", None)
-                if snaps_per_rev is None:
-                    raise ValueError(
-                        "lagrangian_snaps_per_rev must be set in config when "
-                        "lagrangian_reconstruct_training_only=True."
-                    )
+            # Reuse entire training set for inference (removed conditional subsetting)
+            infer_times = train_times
+            infer_scaled = train_scaled
+            infer_data = train_data
+            s_inf, n_points_inf, n_features_inf_total = infer_scaled.shape
+            # For clipping later, we need 'flat_dyn' from the training branch
+            # The variable 'flat_dyn' is available in the local scope from the training branch above.
 
-                rev_index = getattr(config, "lagrangian_reconstruct_rev_index", 0)
-                if not (0 <= rev_index < len(infer_dirs)):
-                    raise ValueError(
-                        f"lagrangian_reconstruct_rev_index={rev_index} is out of "
-                        f"range for rev_dirs={infer_dirs}"
-                    )
-
-                start = rev_index * snaps_per_rev
-                end = start + snaps_per_rev
-
-                if end > train_scaled.shape[0]:
-                    raise ValueError(
-                        f"Requested snapshots {start}..{end-1} but only "
-                        f"{train_scaled.shape[0]} total. Check lagrangian_snaps_per_rev "
-                        f"and lagrangian_reconstruct_rev_index."
-                    )
-
-                subset_slice = slice(start, end)
-
-                print(
-                    f"[INFO] Reconstructing training Rev index {rev_index} "
-                    f"(snapshots {start}..{end-1})"
-                )
-
-                infer_times = train_times[subset_slice]
-                infer_scaled = train_scaled[subset_slice]
-                infer_data = train_data[subset_slice]
-                s_inf, n_points_inf, n_features_inf_total = infer_scaled.shape
-            else:
-                # Reuse entire training set for inference
-                infer_times = train_times
-                infer_scaled = train_scaled
-                infer_data = train_data
-                s_inf, n_points_inf, n_features_inf_total = infer_scaled.shape
         else:
             # skip_training path: load and scale from npy now
             print("[INFO] Loading Lagrangian data from npy for inference...")
@@ -379,16 +355,18 @@ def run_lagrangian_ml_pipeline(config, log_time):
             flat_inf_scaled = np.concatenate([flat_inf_dyn_scaled, flat_inf_ids], axis=1)
             infer_scaled = flat_inf_scaled.reshape(infer_data.shape)
 
-        # Torch inference in batches
+        # Torch inference setup
         # Build parameter array for inference if available
         param_mapping = getattr(config, "param_mapping", None)
         params_infer = None
         if param_mapping is not None:
             if trained_here:
-                # Reuse params_all from training if available; slice if needed
+                # Reuse params_all from training if available
+                # Note: 'params_all' is in locals() if config.param_mapping was set during training
                 if "params_all" in locals() and params_all is not None:
-                    params_infer = params_all[subset_slice]
+                    params_infer = params_all
                 else:
+                    # If model was loaded, build params for the current infer_dirs
                     params_infer = build_params_from_rev_dirs(infer_dirs, param_mapping)
             else:
                 # skip_training path: build params for inference rev_dirs
@@ -400,22 +378,22 @@ def run_lagrangian_ml_pipeline(config, log_time):
                     f"infer_scaled has {s_inf} snapshots"
                 )
 
-        model.eval()
+        # Torch inference in batches
         infer_batch_size = getattr(
             config, "infer_batch_size", getattr(config, "batch_size", 2)
         )
         preds_scaled_list = []
 
         with torch.no_grad():
-            x_all = torch.from_numpy(infer_scaled).float().to(device)  # [S, N, 6]
+            x_all = torch.from_numpy(infer_scaled).float().to(device) # [S, N, 6]
             if params_infer is not None:
-                p_all = torch.from_numpy(params_infer).float().to(device)  # [S, P]
+                p_all = torch.from_numpy(params_infer).float().to(device) # [S, P]
             else:
                 p_all = None
 
             for b_start in range(0, s_inf, infer_batch_size):
-                x_b_full = x_all[b_start : b_start + infer_batch_size]  # [B, N, 6]
-                x_b_dyn = x_b_full[..., :4]                             # [B, N, 4]
+                x_b_full = x_all[b_start : b_start + infer_batch_size] # [B, N, 6]
+                x_b_dyn = x_b_full[..., :4]                              # [B, N, 4]
                 if p_all is not None:
                     p_b = p_all[b_start : b_start + infer_batch_size]   # [B, P]
                     recon_b, _ = model(x_b_dyn, p_b)                    # recon_b: [B, N, 4]
@@ -423,49 +401,110 @@ def run_lagrangian_ml_pipeline(config, log_time):
                     recon_b, _ = model(x_b_dyn)                         # recon_b: [B, N, 4]
                 preds_scaled_list.append(recon_b.cpu().numpy())
 
-        preds_scaled = np.concatenate(preds_scaled_list, axis=0)       # [S, N, 4]
+        preds_scaled = np.concatenate(preds_scaled_list, axis=0)      # [S, N, 4]
 
-        # DEBUG: inspect one training snapshot reconstruction BEFORE inverse scaling / clipping / writing
-        if trained_here and reconstruct_training_only:
-            # pick first snapshot of the subset
-            s0 = 0
-            orig_scaled = infer_scaled[s0]   # [N, 6]
-            recon_scaled = preds_scaled[s0]  # [N, 4]
+    # ------------------------------------------------------------------
+    # Optional: auto-build all-4-channel linear baseline file for
+    # Lagrangian ROM if requested and not already present. This must
+    # happen AFTER data is loaded but BEFORE the final inference logic.
+    # We move this to where it was initially intended.
+    # ------------------------------------------------------------------
+    use_baseline_infer = getattr(config, "lagrangian_use_baseline", False)
+    baseline_path = getattr(config, "lagrangian_baseline_infer_npy", None)
 
-            # inverse transform dynamics ONLY
-            orig_flat_dyn = orig_scaled[..., :4].reshape(-1, 4)
-            recon_flat_dyn = recon_scaled.reshape(-1, 4)
+    if use_baseline_infer and baseline_path is not None and not os.path.exists(baseline_path):
+        if not trained_here:
+            raise RuntimeError(
+                "lagrangian_use_baseline=True and baseline file is missing, "
+                "but skip_training=True or no training data in memory. "
+                "Please either provide an existing baseline .npy file or "
+                "run training with baseline enabled."
+            )
+        # Note: params_all is guaranteed to be in locals() and not None if param_mapping is set and trained_here is True
+        if params_all is None:
+            raise RuntimeError(
+                "lagrangian_use_baseline=True but params_all is None. "
+                "Baseline requires a scalar parameter mapping."
+            )
 
-            orig_dyn = scaler.inverse_transform(orig_flat_dyn).reshape(-1, 4)
-            recon_dyn = scaler.inverse_transform(recon_flat_dyn).reshape(-1, 4)
+        print(f"[INFO] Baseline file not found at {baseline_path}; building all-4-channel linear baseline...")
 
-            # Print basic stats so we see if x/z are frozen
-            for i, name in enumerate(["x", "y", "z", field_var]):
-                o_min, o_max = orig_dyn[:, i].min(), orig_dyn[:, i].max()
-                r_min, r_max = recon_dyn[:, i].min(), recon_dyn[:, i].max()
-                print(f"[DEBUG] {name}: orig [{o_min:.3e}, {o_max:.3e}]  "
-                      f"recon [{r_min:.3e}, {r_max:.3e}]")
+        poly_deg = getattr(config, "lagrangian_baseline_poly_deg", 1)
+        ridge_alpha = getattr(config, "lagrangian_baseline_ridge_alpha", 1e-6)
+        atol = getattr(config, "lagrangian_baseline_atol", 1e-8)
 
-        # Inverse scale back to physical space for the 4 dynamic features
-        flat_pred = preds_scaled.reshape(-1, 4)
-        flat_pred_unscaled = scaler.inverse_transform(flat_pred)  # [S*N, 4]
+        # Note: We use train_data/params_all for model building, but infer_times/params_infer/scaler for prediction
+        baseline_model, meta = build_lagrangian_baseline_model_all4(
+            train_times=train_times,
+            params_all=params_all,
+            train_data=train_data,
+            poly_deg=poly_deg,
+            ridge_alpha=ridge_alpha,
+            atol=atol,
+        )
 
-        # Use training min/max explicitly for clipping
-        if trained_here:
-            # flat_dyn is available from the training branch
-            train_min = flat_dyn.min(axis=0)
-            train_max = flat_dyn.max(axis=0)
-        else:
-            # skip_training path: derive bounds from the inference data itself
-            train_min = flat_inf_dyn.min(axis=0)
-            train_max = flat_inf_dyn.max(axis=0)
+        build_lagrangian_baseline_dyn_scaled_all4(
+            baseline_model=baseline_model,
+            infer_times=infer_times,
+            params_infer=params_infer,
+            scaler=scaler,
+            n_points=n_points_inf,
+            out_path=baseline_path,
+        )
 
-        flat_pred_clipped = np.clip(flat_pred_unscaled, train_min, train_max)
-        pred_dyn = flat_pred_clipped.reshape(preds_scaled.shape)  # [S, N, 4]
 
-        # Append static IDs (CloudID, CloudID_base) from data in ROM feature space
-        ids = infer_data[..., 4:]  # [S, N, 2]
-        pred_array = np.concatenate([pred_dyn, ids], axis=-1)  # [S, N, 6]
+    # ------------------------------------------------------------------
+    # Baseline + residual at inference (in scaled space) - Logic Cleanup
+    # ------------------------------------------------------------------
+    dyn_scaled_full = preds_scaled # Start with prediction (residual)
+
+    baseline_dyn_scaled = None
+    if use_baseline_infer:
+        if baseline_path is None:
+            raise ValueError(
+                "lagrangian_use_baseline=True but "
+                "lagrangian_baseline_infer_npy is not set in the config."
+            )
+
+        # Load baseline for inference/reconstruction
+        baseline_dyn_scaled = np.load(baseline_path)
+        if baseline_dyn_scaled.shape != preds_scaled.shape:
+            raise ValueError(
+                f"Baseline shape {baseline_dyn_scaled.shape} does not match "
+                f"preds_scaled shape {preds_scaled.shape}."
+            )
+
+        # Model output is residual in scaled space, add the baseline back
+        dyn_scaled_full = baseline_dyn_scaled + preds_scaled
+
+    # DEBUG: inspect one training snapshot reconstruction BEFORE inverse scaling / clipping / writing
+    # REMOVED: This debug logic specifically checks 'reconstruct_training_only' which was removed.
+    # The variables it uses (orig_scaled, flat_dyn, etc.) are only guaranteed if trained_here.
+    # Since we can't be sure of 'orig_scaled' after removal, this block is best deleted.
+    # if trained_here and reconstruct_training_only:
+    # ...
+
+    # Inverse scale back to physical space for the 4 dynamic features
+    flat_pred = dyn_scaled_full.reshape(-1, 4)
+    flat_pred_unscaled = scaler.inverse_transform(flat_pred) # [S*N, 4]
+
+    # Use training min/max explicitly for clipping
+    if trained_here:
+        # flat_dyn is available from the training branch
+        train_min = flat_dyn.min(axis=0)
+        train_max = flat_dyn.max(axis=0)
+    else:
+        # skip_training path: derive bounds from the inference data itself
+        # Note: If skip_training=True, we use flat_inf_dyn which was calculated in the inference branch
+        train_min = flat_inf_dyn.min(axis=0)
+        train_max = flat_inf_dyn.max(axis=0)
+
+    flat_pred_clipped = np.clip(flat_pred_unscaled, train_min, train_max)
+    pred_dyn = flat_pred_clipped.reshape(preds_scaled.shape) # [S, N, 4]
+
+    # Append static IDs (CloudID, CloudID_base) from data in ROM feature space
+    ids = infer_data[..., 4:] # [S, N, 2]
+    pred_array = np.concatenate([pred_dyn, ids], axis=-1) # [S, N, 6]
 
     # ---------------- Write ROM outputs in particles*.txt format ----------------
     with log_time("Writing Lagrangian ROM output"):
@@ -485,8 +524,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
             print(f"[INFO] Loading STL geometry: {stl_path}")
             projector = GeometryProjector(stl_path)
             print("[INFO] STL loaded. Beginning geometry projection...")
-
-            from tqdm import tqdm
 
             s_inf, n_points_inf, _ = pred_array.shape
 

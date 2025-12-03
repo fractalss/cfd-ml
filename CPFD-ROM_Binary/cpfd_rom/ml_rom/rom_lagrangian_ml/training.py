@@ -13,29 +13,56 @@ def _forward_pointnet(
     model: nn.Module,
     batch,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Unified forward helper for PointNet autoencoder.
 
     Works for both dataset types:
       - SnapshotDataset:       batch is a Tensor [B, n_points, n_features_total]
-      - SnapshotParamDataset:  batch is a dict {"x": Tensor, "params": Tensor}
+      - SnapshotParamDataset:  batch is a dict {"x": Tensor, "params": Tensor, ...}
 
-    The network now operates **only on the first 4 dynamic features**:
+    The network operates only on the first 4 dynamic features:
         [x, y, z, field]
 
-    so we slice `x[..., :4]` before passing it to the model. The full
-    `x_full` (with IDs etc.) is returned so the training loop can
-    compute the loss against `x_full[..., :4]` and keep the rest for
-    downstream use if needed.
+    If the batch contains a key "baseline", it is interpreted as a
+    per-point baseline for these 4 channels in the *same scaled space*
+    as the inputs, and the model output is treated as a residual to be
+    added to this baseline.
+
+    Returns
+    -------
+    recon : torch.Tensor
+        Model output for the 4 dynamic channels, interpreted as either
+        full-state or residual depending on whether a baseline is
+        provided. Shape [B, N, 4].
+    x_full : torch.Tensor
+        Full input tensor as provided by the DataLoader, including IDs
+        etc. Shape [B, N, n_features_total].
+    baseline_dyn : Optional[torch.Tensor]
+        Baseline for the 4 dynamic channels, or None if not provided
+        in the batch. Shape [B, N, 4] if present.
     """
+    baseline_dyn: Optional[torch.Tensor] = None
+
     if isinstance(batch, dict):
-        x_full = batch["x"].to(device)              # [B, N, n_features_total]
-        params = batch["params"].to(device)
-        x_dyn = x_full[..., :4]                      # [B, N, 4]
-        out = model(x_dyn, params=params)
+        x_full = batch["x"].to(device)  # [B, N, n_features_total]
+        params = batch.get("params")
+        if params is not None:
+            params = params.to(device)
+
+        # Optional baseline in scaled space
+        if "baseline" in batch:
+            baseline_full = batch["baseline"].to(device)  # [B, N, >=4]
+            baseline_dyn = baseline_full[..., :4]          # [B, N, 4]
+
+        x_dyn = x_full[..., :4]                            # [B, N, 4]
+        if params is not None:
+            out = model(x_dyn, params=params)
+        else:
+            out = model(x_dyn)
     else:
-        x_full = batch.to(device)                    # [B, N, n_features_total]
-        x_dyn = x_full[..., :4]                      # [B, N, 4]
+        # Plain tensor batch with no params / baseline
+        x_full = batch.to(device)                          # [B, N, n_features_total]
+        x_dyn = x_full[..., :4]                            # [B, N, 4]
         out = model(x_dyn)
 
     if isinstance(out, tuple):
@@ -43,7 +70,7 @@ def _forward_pointnet(
     else:
         recon = out
 
-    return recon, x_full
+    return recon, x_full, baseline_dyn
 
 def train_pointnet_torch(
     model: nn.Module,
@@ -75,11 +102,25 @@ def train_pointnet_torch(
 
         for batch in tqdm(train_loader, desc=f"[Epoch {epoch:03d}] train", leave=False):
             optimizer.zero_grad()
-            recon, x = _forward_pointnet(model, batch, device)
-            x_target = x[..., :recon.shape[2]]
-            loss = F.mse_loss(recon, x_target)
+
+            # Forward pass: may include optional baseline in scaled space
+            recon, x, baseline_dyn = _forward_pointnet(model, batch, device)
+
+            # Target CFD state (scaled) for the 4 dynamic channels
+            x_target = x[..., :recon.shape[2]]  # [B, N, 4]
+
+            # If a baseline is provided, interpret recon as residual
+            # and add it to the baseline in scaled space. Otherwise
+            # recon is the full-state prediction.
+            if baseline_dyn is not None:
+                pred_dyn = baseline_dyn + recon
+            else:
+                pred_dyn = recon
+
+            loss = F.mse_loss(pred_dyn, x_target)
             loss.backward()
             optimizer.step()
+
             batch_size = x.size(0)
             train_loss_sum += loss.item() * batch_size
             train_count += batch_size
@@ -92,9 +133,15 @@ def train_pointnet_torch(
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"[Epoch {epoch:03d}] val", leave=False):
-                recon, x = _forward_pointnet(model, batch, device)
-                x_target = x[..., :recon.shape[2]]
-                loss = F.mse_loss(recon, x_target)
+                recon, x, baseline_dyn = _forward_pointnet(model, batch, device)
+                x_target = x[..., :recon.shape[2]]  # [B, N, 4]
+
+                if baseline_dyn is not None:
+                    pred_dyn = baseline_dyn + recon
+                else:
+                    pred_dyn = recon
+
+                loss = F.mse_loss(pred_dyn, x_target)
                 batch_size = x.size(0)
                 val_loss_sum += loss.item() * batch_size
                 val_count += batch_size
