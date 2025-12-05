@@ -70,7 +70,7 @@ def _load_one_rev_npy(directory: str):
         desc=f"Loading snapshots in {os.path.basename(dir_path)}",
     ):
         fname = row["filename"]
-        t = row["time"]
+        t = float(row["time"])  # <-- ensure type safety for downstream logic
         npy_path = os.path.join(dir_path, fname)
         if not os.path.exists(npy_path):
             raise FileNotFoundError(

@@ -111,6 +111,37 @@ def build_params_from_rev_dirs(rev_dirs, param_mapping):
         all_params.extend([v_arr] * n)
 
     return np.array(all_params, dtype=np.float32)
+class BaselineResidualDataset(torch.utils.data.Dataset):
+    """
+    Each item:
+      X : [N, 4+P]  baseline_dyn_scaled concatenated with tiled params
+      R : [N, 4]    residual_dyn_scaled
+    """
+    def __init__(self, baseline_dyn_scaled, params_all, resid_dyn_scaled):
+        # baseline_dyn_scaled: [S, N, 4]
+        # params_all:          [S, P]
+        # resid_dyn_scaled:    [S, N, 4]
+        assert baseline_dyn_scaled.shape == resid_dyn_scaled.shape
+        assert baseline_dyn_scaled.shape[0] == params_all.shape[0]
+
+        self.baseline = baseline_dyn_scaled.astype(np.float32)
+        self.params   = params_all.astype(np.float32)
+        self.resid    = resid_dyn_scaled.astype(np.float32)
+
+    def __len__(self):
+        return self.baseline.shape[0]
+
+    def __getitem__(self, idx):
+        B = self.baseline[idx]           # [N, 4]
+        p = self.params[idx]             # [P]
+        R = self.resid[idx]              # [N, 4]
+
+        # tile p to match per-particle dimension
+        N = B.shape[0]
+        P_tiled = np.repeat(p[None, :], N, axis=0)  # [N, P]
+        X = np.concatenate([B, P_tiled], axis=-1)   # [N, 4+P]
+
+        return X, p, R
 
 
-__all__ = ["SnapshotDataset", "SnapshotParamDataset", "build_params_from_rev_dirs"]
+__all__ = ["SnapshotDataset", "SnapshotParamDataset", "BaselineResidualDataset", "build_params_from_rev_dirs"]
