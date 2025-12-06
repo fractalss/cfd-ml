@@ -28,12 +28,6 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import (
     build_params_from_rev_dirs,
 )
 
-from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
-    LatentRegressorMLP,
-    build_latent_regression_dataloaders,
-    train_latent_regressor_torch,
-)
-
 from cpfd_rom.util.output_utils import setup_output_dir
 from cpfd_rom.util.model_utils import setup_model_paths
 
@@ -132,32 +126,23 @@ class SnapshotParamDatasetLagrangian(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline: param+time-conditioned PointNet AE + latent regressor
+# Main pipeline: param+time-conditioned PointNet AE (no baseline)
 # ---------------------------------------------------------------------------
 
 def run_lagrangian_ml_pipeline(config, log_time):
     """Param+time conditioned PointNet autoencoder pipeline for Lagrangian ROM.
 
-    Phase 1: AE
+    Workflow:
       1) Load snapshots & physical params.
       2) Scale CFD dynamic features [x,y,z,field].
       3) Build augmented parameters per snapshot:
              params_aug = [params_phys, t_norm in [0,1]].
       4) Train PointNetAutoencoder:
              x_dyn_scaled | params_aug  ->  x_dyn_scaled  (reconstruction).
-
-    Phase 2: Latent regressor
-      5) Extract latent codes z[s] from the trained AE encoder.
-      6) Train LatentRegressorMLP:
-             (params_phys, t_norm) -> z.
-
-    Inference at config.user_parameter:
-      7) Choose nearest-parameter Rev as the *template geometry*:
-           - use its times + IDs + scaled [x,y,z,field] as template.
-      8) For (user_parameter, that time grid):
-           params_aug_inf -> z_pred (via regressor)
-           z_pred, template_x, params_aug_inf -> x_dyn_scaled_pred (via AE decoder)
-           -> inverse-scale, clip, write ROM.
+      5) Inference at config.user_parameter:
+             - choose nearest training parameter group (rev),
+             - reconstruct its snapshots with the AE,
+             - inverse-scale, clip, write ROM for those snapshots.
     """
 
     # ---------------- Device ----------------
@@ -185,20 +170,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = base_model_path
     scaler_path = base_stem + "_scaler.pkl"
     script_path = base_stem + "_script.pt"
-    latent_reg_path = base_stem + "_latent_reg.pt"
 
-    epochs = getattr(config, "epochs", 2)
+    epochs = getattr(config, "epochs", 50)
     batch_size = getattr(config, "batch_size", 2)
-    patience = getattr(config, "patience", 5)
-    lr = getattr(config, "learning_rate", 1e-3)
+    patience = getattr(config, "patience", 10)
+    lr = getattr(config, "learning_rate", 1e-4)
     latent_dim = getattr(config, "latent_dim", 256)
-
-    # Latent regressor training config (can be overridden in YAML)
-    latent_reg_epochs = getattr(config, "latent_reg_epochs", 500)
-    latent_reg_lr = getattr(config, "latent_reg_lr", 1e-3)
-    latent_reg_weight_decay = getattr(config, "latent_reg_weight_decay", 0.0)
-    latent_reg_patience = getattr(config, "latent_reg_patience", 30)
-    latent_reg_hidden = getattr(config, "latent_reg_hidden_dims", (128, 128))
 
     field_var = getattr(config, "field_variable", None)
     if field_var is None:
@@ -245,7 +222,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     param_dim_phys = params_all.shape[1]
     config.param_dim_phys = param_dim_phys
 
-    # Basic info about param groups (Revs)
+    # Basic info about param groups (revs)
     unique_params, rev_indices = np.unique(
         params_all, axis=0, return_inverse=True
     )  # unique_params[G, P_phys], rev_indices[S]
@@ -385,13 +362,13 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 patience=patience,
             )
 
-        # save AE model + scaler
+        # save model + scaler
         torch.save(ae_model.state_dict(), model_path)
         joblib.dump(scaler, scaler_path)
         print(f"[INFO] Saved AE model to {model_path}")
         print(f"[INFO] Saved scaler to {scaler_path}")
 
-        # optional TorchScript export (AE forward only)
+        # optional TorchScript export
         try:
             ae_model.eval()
             example_x = torch.randn(1, n_points, 4, device=device)
@@ -405,89 +382,14 @@ def run_lagrangian_ml_pipeline(config, log_time):
     ae_model.eval()
 
     # ==============================================================
-    # 4b. PHASE 2: LATENT REGRESSOR TRAINING
+    # 5. INFERENCE AT user_parameter (nearest training param)
     # ==============================================================
 
-    latent_reg_model = LatentRegressorMLP(
-        in_dim=param_dim_aug,
-        latent_dim=latent_dim,
-        hidden_dims=tuple(latent_reg_hidden),
-    ).to(device)
+    with log_time("Running Lagrangian AE inference at user_parameter"):
+        n_revs = len(config.rev_dirs)
+        snaps_per_rev = n_snaps // n_revs  # assume equal snapshots per rev
 
-    if skip_training and os.path.exists(latent_reg_path):
-        with log_time("Loading pretrained latent regressor"):
-            print(f"[INFO] Loading latent regressor from {latent_reg_path}")
-            state_dict = torch.load(latent_reg_path, map_location=device)
-            latent_reg_model.load_state_dict(state_dict)
-    else:
-        # Extract latent codes z[s] for all snapshots from the AE encoder
-        print("[INFO] Extracting latent codes from AE for latent regression...")
-        latents_list = []
-        infer_batch_size = getattr(config, "latent_reg_batch_size", batch_size)
-
-        with torch.no_grad():
-            for b_start in range(0, n_snaps, infer_batch_size):
-                x_b = torch.from_numpy(
-                    train_dyn_scaled[b_start:b_start + infer_batch_size]
-                ).float().to(device)              # [B, N, 4]
-
-                p_b = torch.from_numpy(
-                    params_aug[b_start:b_start + infer_batch_size]
-                ).float().to(device)               # [B, P_aug]
-
-                out = ae_model(x_b, params=p_b)
-                if isinstance(out, tuple):
-                    _, z_b = out                # [B, Z]
-                else:
-                    raise RuntimeError(
-                        "[Lagrangian] PointNetAutoencoder forward() must return (recon, latent) "
-                        "for latent regression phase."
-                    )
-
-                latents_list.append(z_b.cpu().numpy())
-
-        latents_all = np.concatenate(latents_list, axis=0)   # [S, Z]
-        if latents_all.shape[0] != n_snaps:
-            raise RuntimeError(
-                f"[Lagrangian] Latent extraction mismatch: got {latents_all.shape[0]} latents "
-                f"for {n_snaps} snapshots."
-            )
-
-        # Build loaders for latent regression
-        train_loader_reg, val_loader_reg = build_latent_regression_dataloaders(
-            params_aug=params_aug,      # [S, P_aug]
-            latents=latents_all,        # [S, Z]
-            batch_size=getattr(config, "latent_reg_batch_size", 32),
-            val_fraction=getattr(config, "latent_reg_val_fraction", 0.2),
-            random_state=42,
-            shuffle=True,
-        )
-
-        with log_time("Training latent regressor (params+time -> latent)"):
-            print("[INFO] Training latent regressor MLP...")
-            latent_reg_model = train_latent_regressor_torch(
-                latent_reg_model,
-                train_loader_reg,
-                val_loader_reg,
-                device=device,
-                epochs=latent_reg_epochs,
-                lr=latent_reg_lr,
-                weight_decay=latent_reg_weight_decay,
-                patience=latent_reg_patience,
-            )
-
-        # Save latent regressor
-        torch.save(latent_reg_model.state_dict(), latent_reg_path)
-        print(f"[INFO] Saved latent regressor to {latent_reg_path}")
-
-    latent_reg_model.eval()
-
-    # ==============================================================
-    # 5. INFERENCE AT user_parameter VIA LATENT REGRESSOR
-    #      + NEAREST-REV TEMPLATE GEOMETRY
-    # ==============================================================
-
-    with log_time("Running Lagrangian AE+latent-reg inference at user_parameter"):
+        # Choose nearest training param group to user_parameter
         infer_param = getattr(config, "user_parameter", None)
         if infer_param is None:
             raise ValueError(
@@ -501,90 +403,50 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 f"does not match param_dim_phys {param_dim_phys}"
             )
 
-        # ---- Map user_parameter to nearest unique param group ----
+        # Find nearest unique parameter (rev) in L2 sense
         dists = np.linalg.norm(unique_params - infer_param_vec[None, :], axis=1)
         best_group = int(np.argmin(dists))
-        target_param = unique_params[best_group]
         print(
             f"[INFO] Nearest training parameter group index = {best_group}, "
             f"distance = {dists[best_group]:.3e}"
         )
 
-        # We assume snapshots are grouped by Rev with constant params per block.
-        # Try to map unique parameter -> specific Rev index.
-        n_revs = len(config.rev_dirs)
-        snaps_per_rev = n_snaps // n_revs  # assume equal snapshots per rev
-
-        rev_idx = None
-        for r in range(n_revs):
-            s0_r = r * snaps_per_rev
-            s1_r = s0_r + snaps_per_rev
-            # Check the first snapshot in this Rev block
-            if np.allclose(params_all[s0_r], target_param, atol=1e-6, rtol=0.0):
-                rev_idx = r
-                break
-
-        if rev_idx is None:
+        # Assume rev_dirs are ordered such that each unique param corresponds
+        # to a block of snapshots of length snaps_per_rev.
+        if n_param_groups != n_revs:
             print(
-                "[WARN] Could not map unique param group cleanly to a Rev index; "
-                "falling back to rev_idx = min(best_group, n_revs-1)."
+                "[WARN] n_param_groups != n_revs; inference rev mapping may be approximate."
             )
-            rev_idx = min(best_group, n_revs - 1)
+        rev_idx = min(best_group, n_revs - 1)
 
         s0 = rev_idx * snaps_per_rev
         s1 = s0 + snaps_per_rev
-        print(f"[INFO] Using Rev index {rev_idx} as template, snapshots [{s0}:{s1}] for inference.")
+        print(f"[INFO] Using snapshots [{s0}:{s1}] for inference.")
 
-        T = snaps_per_rev
+        # Inputs for this rev
+        dyn_scaled_infer = train_dyn_scaled[s0:s1]   # [T, N, 4]
+        params_aug_infer = params_aug[s0:s1]         # [T, P_aug]
+        times_unique = train_times[s0:s1].copy()     # [T]
+        ids = train_data[s0:s1, :, 4:]               # [T, N, 2]
 
-        # Template geometry and IDs from nearest Rev
-        template_dyn_scaled = train_dyn_scaled[s0:s1].copy()   # [T, N, 4]
-        ids = train_data[s0:s1, :, 4:]                         # [T, N, 2]
-        times_inf = train_times[s0:s1].copy()                  # [T]
-
-        # ---------- Build params_aug_inf for user_parameter on that time grid ----------
-        params_infer_phys = np.repeat(infer_param_vec[None, :], T, axis=0)  # [T, P_phys]
-
-        if t_max > t_min:
-            t_norm_inf = (times_inf - t_min) / (t_max - t_min)
-        else:
-            t_norm_inf = np.zeros_like(times_inf)
-        t_norm_inf = t_norm_inf.astype(np.float32).reshape(-1, 1)   # [T, 1]
-
-        params_aug_inf = np.concatenate(
-            [params_infer_phys.astype(np.float32), t_norm_inf],
-            axis=1,
-        )  # [T, P_aug]
-
-        # ---------- Predict latent codes & decode with template geometry ----------
+        # Run AE
         preds_scaled_list = []
         infer_batch_size = getattr(config, "infer_batch_size", batch_size)
 
-        if not hasattr(ae_model, "decode"):
-            raise RuntimeError(
-                "[Lagrangian] PointNetAutoencoder must implement a "
-                "decode(z, template_x, params=None) method for param-driven inference."
-            )
         with torch.no_grad():
-            for b_start in range(0, T, infer_batch_size):
-                p_b = torch.from_numpy(
-                    params_aug_inf[b_start:b_start + infer_batch_size]
-                ).float().to(device)  # [B, P_aug]
-
-                # latent from regressor
-                z_b = latent_reg_model(p_b)  # [B, latent_dim]
-
-                # template geometry from chosen Rev
-                template_b = torch.from_numpy(
-                    template_dyn_scaled[b_start:b_start + infer_batch_size]
+            for b_start in range(0, dyn_scaled_infer.shape[0], infer_batch_size):
+                x_b = torch.from_numpy(
+                    dyn_scaled_infer[b_start:b_start + infer_batch_size]
                 ).float().to(device)  # [B, N, 4]
 
-                # decode using latent + template + params
-                recon_b = ae_model.decode(z_b, template_b, params=p_b)  # [B, N, 4]
+                p_b = torch.from_numpy(
+                    params_aug_infer[b_start:b_start + infer_batch_size]
+                ).float().to(device)  # [B, P_aug]
+
+                recon_b, _ = ae_model(x_b, params=p_b)  # [B, N, 4]
                 preds_scaled_list.append(recon_b.cpu().numpy())
 
         dyn_scaled_full = np.concatenate(preds_scaled_list, axis=0)  # [T, N, 4]
-        times_unique = times_inf  # for writing
 
     # ==============================================================
     # 6. INVERSE SCALING, CLIPPING, GEOMETRY, WRITE
