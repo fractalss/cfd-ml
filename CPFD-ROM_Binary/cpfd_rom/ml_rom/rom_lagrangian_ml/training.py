@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Generic PointNet autoencoder trainer (still used by other pipelines)
+# Generic PointNet autoencoder / decoder trainer (still used by other pipelines)
 # ---------------------------------------------------------------------------
 
 def _forward_pointnet(
@@ -23,8 +23,10 @@ def _forward_pointnet(
     """Unified forward helper for PointNet autoencoder / decoder.
 
     Works for both dataset types:
-      - SnapshotDataset:       batch is a Tensor [B, N, n_features_total]
-      - SnapshotParamDataset:  batch is a dict {"x": Tensor, "params": Tensor, ...}
+      - SnapshotDataset:
+            batch is a Tensor [B, N, n_features_total]
+      - SnapshotParamDataset:
+            batch is a dict {"x": Tensor, "params": Tensor, ...}
 
     The network operates only on the first 4 dynamic features:
         [x, y, z, field]
@@ -33,7 +35,8 @@ def _forward_pointnet(
     per-point baseline for these 4 channels in the *same scaled space*
     as the inputs, and the model output is treated as a residual to be
     added to this baseline. In the current Lagrangian ROM pipeline this
-    baseline comes from a linear / ridge regression model.
+    baseline typically comes from a linear / ridge regression model
+    built on flattened [x, y, z, field].
     """
     baseline_dyn: Optional[torch.Tensor] = None
 
@@ -178,106 +181,8 @@ def train_pointnet_torch(
 
 # ---------------------------------------------------------------------------
 # Residual decoder trainer (linear/ridge baseline + params -> residual)
-# # ---------------------------------------------------------------------------
-#
-# def train_pointnet_residual_torch(
-#     model: nn.Module,
-#     train_loader: torch.utils.data.DataLoader,
-#     val_loader: torch.utils.data.DataLoader,
-#     device: torch.device,
-#     epochs: int = 50,
-#     lr: float = 1e-3,
-#     patience: int = 10,
-# ) -> nn.Module:
-#     """
-#     Train a residual decoder of the form:
-#
-#         R_pred = model(baseline_dyn_scaled, params)
-#
-#     where
-#         baseline_dyn_scaled : [B, N, 4]  - baseline dynamic features in scaled space
-#         params              : [B, P]     - global parameters per snapshot
-#         R_true              : [B, N, 4]  - target residual (scaled)
-#
-#     In the Lagrangian ROM pipeline, baseline_dyn_scaled is produced by a
-#     linear / ridge regression model over flattened [x,y,z,field] using
-#     the Eulerian baseline infrastructure, then reshaped to [S, N, 4] and
-#     scaled with a StandardScaler.
-#
-#     The DataLoader is assumed to come from BaselineResidualDataset, whose
-#     __getitem__ returns:
-#
-#         X_b : [N, 4+P]  (baseline_dyn_scaled concatenated with tiled params)
-#         p_b : [P]
-#         R_b : [N, 4]
-#
-#     We only use X_b[..., :4] as baseline_dyn_scaled inside this trainer.
-#     """
-#     model.to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-#
-#     best_val_loss = float("inf")
-#     patience_counter = 0
-#     best_state = None
-#
-#     for epoch in range(1, epochs + 1):
-#         # ---------------- TRAIN ----------------
-#         model.train()
-#         train_losses = []
-#
-#         for X_b, p_b, R_b in train_loader:
-#             # X_b: [B, N, 4+P]  (we only use first 4 channels as baseline)
-#             # p_b: [B, P]
-#             # R_b: [B, N, 4]
-#
-#             X_b = X_b.to(device)
-#             p_b = p_b.to(device)
-#             R_b = R_b.to(device)
-#
-#             baseline_dyn_scaled_b = X_b[..., :4]  # [B, N, 4]
-#
-#             optimizer.zero_grad()
-#             R_pred = model(baseline_dyn_scaled_b, p_b)  # [B, N, 4]
-#             loss = F.mse_loss(R_pred, R_b)
-#             loss.backward()
-#             optimizer.step()
-#
-#             train_losses.append(loss.item())
-#
-#         train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
-#
-#         # ---------------- VAL ----------------
-#         model.eval()
-#         val_losses = []
-#         with torch.no_grad():
-#             for X_b, p_b, R_b in val_loader:
-#                 X_b = X_b.to(device)
-#                 p_b = p_b.to(device)
-#                 R_b = R_b.to(device)
-#
-#                 baseline_dyn_scaled_b = X_b[..., :4]
-#                 R_pred = model(baseline_dyn_scaled_b, p_b)
-#                 loss = F.mse_loss(R_pred, R_b)
-#                 val_losses.append(loss.item())
-#
-#         val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
-#         print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4e}, val_loss={val_loss:.4e}")
-#
-#         # ---------------- EARLY STOP ----------------
-#         if val_loss < best_val_loss - 1e-6:
-#             best_val_loss = val_loss
-#             patience_counter = 0
-#             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-#         else:
-#             patience_counter += 1
-#             if patience_counter >= patience:
-#                 print(f"[INFO] Early stopping at epoch {epoch}")
-#                 break
-#
-#     if best_state is not None:
-#         model.load_state_dict(best_state)
-#
-#     return model
+# ---------------------------------------------------------------------------
+
 def train_pointnet_residual_torch(
     model: nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -294,30 +199,35 @@ def train_pointnet_residual_torch(
         R_pred = model(baseline_dyn_scaled, params)
 
     where
-        baseline_dyn_scaled : [B, N, 4]  - baseline dynamic features in scaled space
-        params              : [B, P]     - global parameters per snapshot
-        R_true              : [B, N, 4]  - target residual (scaled)
+        baseline_dyn_scaled : [B, N_or_K, 4]  - baseline dynamic features (scaled)
+        params              : [B, P]          - global parameters per snapshot
+        R_true              : [B, N_or_K, 4]  - target residual (scaled)
 
     In the Lagrangian ROM pipeline, baseline_dyn_scaled is produced by a
     linear / ridge regression model over flattened [x,y,z,field] using
-    the Eulerian baseline infrastructure, then reshaped to [S, N, 4] and
-    scaled with a StandardScaler.
+    the Eulerian baseline infrastructure, then reshaped to [S, N, 4] (or
+    [S, K, 4] for coarsened centroids) and scaled with a StandardScaler.
 
-    The DataLoader is assumed to come from BaselineResidualDataset, whose
-    __getitem__ returns:
+    The DataLoader is assumed to come from BaselineResidualDataset (or a
+    compatible variant), whose __getitem__ returns:
 
-        X_b : [N, 4+P]  (baseline_dyn_scaled concatenated with tiled params)
+        X_b : [N_or_K, 4+P]
+              (baseline_dyn_scaled concatenated with tiled params)
         p_b : [P]
-        R_b : [N, 4]
+        R_b : [N_or_K, 4]
 
     We only use X_b[..., :4] as baseline_dyn_scaled inside this trainer.
 
     Loss weighting
     --------------
-    We use a point-wise importance weight based on the norm of the true
-    residual R_b:
+    If importance_alpha <= 0, we use standard MSE:
 
-        r = ||R_b||_2 over channels  -> [B, N]
+        mean( (R_pred - R_true)^2 )
+
+    If importance_alpha > 0, we use a point-wise importance weight based
+    on the norm of the true residual R_b:
+
+        r = ||R_b||_2 over channels  -> [B, N_or_K]
         w = 1 + importance_alpha * (r / mean(r))
 
     and minimize:
@@ -326,6 +236,14 @@ def train_pointnet_residual_torch(
 
     so that regions with large multi-channel residuals (e.g., bubble
     cavity, strong displacement) contribute more strongly to the loss.
+
+    This trainer is agnostic to the particular residual decoder
+    architecture and can be used with both:
+      - PointNetResidualDecoder (dense / parcel level)
+      - PointNetGATResidualDecoder (coarsened centroid graph, K nodes)
+    as long as their forward signature is:
+
+        model(baseline_dyn_scaled_batch, params_batch) -> residual_pred_batch
     """
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -342,30 +260,34 @@ def train_pointnet_residual_torch(
         train_losses = []
 
         for X_b, p_b, R_b in train_loader:
-            # X_b: [B, N, 4+P]  (we only use first 4 channels as baseline)
+            # X_b: [B, N_or_K, 4+P]
             # p_b: [B, P]
-            # R_b: [B, N, 4]
+            # R_b: [B, N_or_K, 4]
 
             X_b = X_b.to(device)
             p_b = p_b.to(device)
             R_b = R_b.to(device)
 
-            baseline_dyn_scaled_b = X_b[..., :4]  # [B, N, 4]
+            baseline_dyn_scaled_b = X_b[..., :4]  # [B, N_or_K, 4]
 
             optimizer.zero_grad()
-            R_pred = model(baseline_dyn_scaled_b, p_b)  # [B, N, 4]
+            R_pred = model(baseline_dyn_scaled_b, p_b)  # [B, N_or_K, 4]
 
-            # ----- Importance-weighted MSE over points and channels -----
-            diff = R_pred - R_b                          # [B, N, 4]
-            se = torch.sum(diff**2, dim=-1)             # [B, N], sum over channels
+            if importance_alpha <= 0.0:
+                # Plain MSE over all points and channels
+                loss = F.mse_loss(R_pred, R_b)
+            else:
+                # Importance-weighted MSE over points and channels
+                diff = R_pred - R_b                          # [B, N, 4]
+                se = torch.sum(diff**2, dim=-1)             # [B, N]
 
-            # Residual magnitude per point (all 4 channels)
-            r = torch.norm(R_b, dim=-1)                 # [B, N]
+                # Residual magnitude per point (all 4 channels)
+                r = torch.norm(R_b, dim=-1)                 # [B, N]
 
-            mean_r = torch.mean(r) + eps
-            w = 1.0 + importance_alpha * (r / mean_r)   # [B, N]
+                mean_r = torch.mean(r) + eps
+                w = 1.0 + importance_alpha * (r / mean_r)   # [B, N]
 
-            loss = torch.mean(w * se)
+                loss = torch.mean(w * se)
 
             loss.backward()
             optimizer.step()
@@ -386,14 +308,18 @@ def train_pointnet_residual_torch(
                 baseline_dyn_scaled_b = X_b[..., :4]
                 R_pred = model(baseline_dyn_scaled_b, p_b)
 
-                diff = R_pred - R_b
-                se = torch.sum(diff**2, dim=-1)         # [B, N]
-                r = torch.norm(R_b, dim=-1)             # [B, N]
+                if importance_alpha <= 0.0:
+                    loss = F.mse_loss(R_pred, R_b)
+                else:
+                    diff = R_pred - R_b
+                    se = torch.sum(diff**2, dim=-1)         # [B, N]
+                    r = torch.norm(R_b, dim=-1)             # [B, N]
 
-                mean_r = torch.mean(r) + eps
-                w = 1.0 + importance_alpha * (r / mean_r)
+                    mean_r = torch.mean(r) + eps
+                    w = 1.0 + importance_alpha * (r / mean_r)
 
-                loss = torch.mean(w * se)
+                    loss = torch.mean(w * se)
+
                 val_losses.append(loss.item())
 
         val_loss = float(np.mean(val_losses)) if val_losses else float("inf")

@@ -6,30 +6,26 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
-import torch.nn.functional as F
+from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm  # For geometry projection loop
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import load_lagrangian_snapshots
+
 from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import (
-    PointNetResidualDecoder,
-    # PointNetGATResidualDecoder,  # keep commented if you want
+    PointNetAutoencoder,
+)
+
+from cpfd_rom.ml_rom.rom_lagrangian_ml.geometry_projection import GeometryProjector
+from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
+
+from cpfd_rom.ml_rom.rom_lagrangian_ml.training import (
+    train_pointnet_torch,
 )
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import (
-    BaselineResidualDataset,
     build_params_from_rev_dirs,
-)
-
-from cpfd_rom.ml_rom.rom_lagrangian_ml.training import (
-    train_pointnet_residual_torch,
-)
-from cpfd_rom.ml_rom.rom_lagrangian_ml.geometry_projection import GeometryProjector
-from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
-from cpfd_rom.ml_rom.rom_lagrangian_ml.baseline_all4 import (
-    build_lagrangian_baseline_model_all4,
-    build_lagrangian_baseline_dyn_scaled_all4,
 )
 
 from cpfd_rom.util.output_utils import setup_output_dir
@@ -85,23 +81,68 @@ def _select_rom_features(data: np.ndarray, rev_dirs, field_var: str) -> np.ndarr
     return data_sel
 
 
+# ---------------------------------------------------------------------------
+# Minimal dataset: per-snapshot (x_dyn_scaled, params_aug)
+# ---------------------------------------------------------------------------
+
+class SnapshotParamDatasetLagrangian(Dataset):
+    """
+    Each item is a dict:
+        {
+            "x":      [N, 4]  dynamic features (scaled) [x, y, z, field],
+            "params": [P]     augmented params [physical..., t_norm]
+        }
+    """
+
+    def __init__(self, dyn_scaled: np.ndarray, params_aug: np.ndarray):
+        """
+        Parameters
+        ----------
+        dyn_scaled : np.ndarray [S, N, 4]
+            Scaled dynamic fields per snapshot.
+        params_aug : np.ndarray [S, P_aug]
+            Augmented param vector per snapshot (physical params + t_norm).
+        """
+        if dyn_scaled.shape[0] != params_aug.shape[0]:
+            raise ValueError(
+                f"SnapshotParamDatasetLagrangian: dyn_scaled has {dyn_scaled.shape[0]} snapshots "
+                f"but params_aug has {params_aug.shape[0]}"
+            )
+        if dyn_scaled.shape[2] != 4:
+            raise ValueError(
+                f"Expected dyn_scaled[...,4] for [x,y,z,field], got {dyn_scaled.shape}"
+            )
+
+        self.x = dyn_scaled.astype(np.float32)       # [S, N, 4]
+        self.params = params_aug.astype(np.float32)  # [S, P_aug]
+
+    def __len__(self) -> int:
+        return self.x.shape[0]
+
+    def __getitem__(self, idx: int):
+        x_i = torch.from_numpy(self.x[idx])        # [N, 4]
+        p_i = torch.from_numpy(self.params[idx])   # [P_aug]
+        return {"x": x_i, "params": p_i}
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline: param+time-conditioned PointNet AE (no baseline)
+# ---------------------------------------------------------------------------
+
 def run_lagrangian_ml_pipeline(config, log_time):
-    """Baseline + residual decoder pipeline for Lagrangian ROM.
+    """Param+time conditioned PointNet autoencoder pipeline for Lagrangian ROM.
 
     Workflow:
-      1) Load snapshots & params (once).
+      1) Load snapshots & physical params.
       2) Scale CFD dynamic features [x,y,z,field].
-      3) Build linear/ridge baseline model and evaluate it on training set
-         using *physical* parameters only (no time appended).
-      4) Augment parameters for the residual decoder by appending a
-         normalized time coordinate t_norm in [0, 1].
-      5) Compute residual_dyn_scaled = CFD_dyn_scaled - baseline_dyn_scaled.
-      6) Train PointNetResidualDecoder:
-             (baseline_dyn_scaled, params_phys+time) -> residual_dyn_scaled.
-      7) Inference at config.user_parameter:
-             baseline_dyn_scaled(user_param_phys, t)
-           + residual_pred_scaled(user_param_phys+time, t)
-           -> inverse-scale, clip, write ROM for 201 snapshots.
+      3) Build augmented parameters per snapshot:
+             params_aug = [params_phys, t_norm in [0,1]].
+      4) Train PointNetAutoencoder:
+             x_dyn_scaled | params_aug  ->  x_dyn_scaled  (reconstruction).
+      5) Inference at config.user_parameter:
+             - choose nearest training parameter group (rev),
+             - reconstruct its snapshots with the AE,
+             - inverse-scale, clip, write ROM for those snapshots.
     """
 
     # ---------------- Device ----------------
@@ -116,7 +157,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
     setup_output_dir(config)
     setup_model_paths(config)
 
-    # robust handling of model/scaler/script paths
     base_model_path = getattr(
         config,
         "model_path_lagrangian",
@@ -130,12 +170,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = base_model_path
     scaler_path = base_stem + "_scaler.pkl"
     script_path = base_stem + "_script.pt"
-    baseline_path = os.path.join(config.model_dir, "baseline_dyn_scaled.npy")
 
     epochs = getattr(config, "epochs", 50)
     batch_size = getattr(config, "batch_size", 2)
     patience = getattr(config, "patience", 10)
-    lr = getattr(config, "learning_rate", 3e-4)
+    lr = getattr(config, "learning_rate", 1e-4)
+    latent_dim = getattr(config, "latent_dim", 256)
 
     field_var = getattr(config, "field_variable", None)
     if field_var is None:
@@ -147,7 +187,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
         raise ValueError("[Lagrangian] config.rev_dirs must be provided.")
 
     # ==============================================================
-    # 1. LOAD SNAPSHOTS & PARAMS ONCE
+    # 1. LOAD SNAPSHOTS & PHYSICAL PARAMS
     # ==============================================================
 
     with log_time("Loading Lagrangian npy snapshots (once)"):
@@ -165,39 +205,29 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 "Continuing but downstream assumes 6."
             )
 
-        # build per-snapshot *physical* params (no time yet)
-        param_mapping = getattr(config, "param_mapping", None)
-        if param_mapping is None:
-            raise RuntimeError(
-                "[Lagrangian] Baseline+residual ROM requires config.param_mapping."
-            )
+    # Physical parameters per snapshot (no time yet)
+    param_mapping = getattr(config, "param_mapping", None)
+    if param_mapping is None:
+        raise RuntimeError(
+            "[Lagrangian] param-conditioned AE requires config.param_mapping."
+        )
 
-        # params_all_phys: [S, P_phys] (e.g. superficial velocity, etc.)
-        params_all_phys = build_params_from_rev_dirs(config.rev_dirs, param_mapping)
-        if params_all_phys.shape[0] != n_snaps:
-            raise ValueError(
-                f"params_all has {params_all_phys.shape[0]} entries but train_data has {n_snaps} snapshots"
-            )
+    params_all = build_params_from_rev_dirs(config.rev_dirs, param_mapping)
+    if params_all.shape[0] != n_snaps:
+        raise ValueError(
+            f"params_all has {params_all.shape[0]} entries but train_data has {n_snaps} snapshots"
+        )
 
-        # ---- Build normalized time coordinate t_norm in [0, 1] for each snapshot ----
-        t_min = float(train_times.min())
-        t_max = float(train_times.max())
-        if t_max > t_min:
-            t_norm = (train_times - t_min) / (t_max - t_min)
-        else:
-            # degenerate case: all times equal
-            t_norm = np.zeros_like(train_times)
-        t_norm = t_norm.astype(np.float32).reshape(-1, 1)  # [S, 1]
+    params_all = params_all.astype(np.float32)    # [S, P_phys]
+    param_dim_phys = params_all.shape[1]
+    config.param_dim_phys = param_dim_phys
 
-        # ---- Augmented params for residual model: [params_phys, t_norm] ----
-        params_all_resid = np.concatenate([params_all_phys, t_norm], axis=1)  # [S, P_phys+1]
-
-        param_dim_phys = params_all_phys.shape[1]
-        param_dim_resid = params_all_resid.shape[1]
-
-        # Store for reference if needed elsewhere
-        config.param_dim_phys = param_dim_phys
-        config.param_dim = param_dim_resid  # param_dim used by residual decoder
+    # Basic info about param groups (revs)
+    unique_params, rev_indices = np.unique(
+        params_all, axis=0, return_inverse=True
+    )  # unique_params[G, P_phys], rev_indices[S]
+    n_param_groups = unique_params.shape[0]
+    print(f"[INFO] Found {n_param_groups} unique parameter vectors across snapshots.")
 
     # ==============================================================
     # 2. SCALE CFD DYNAMIC FEATURES [x,y,z,field]
@@ -251,11 +281,9 @@ def run_lagrangian_ml_pipeline(config, log_time):
         else:
             flat_dyn_scaled = scaler.transform(flat_dyn)
 
-        # CFD dynamic scaled and full scaled (if ever needed)
         flat_scaled = np.concatenate([flat_dyn_scaled, flat_ids], axis=1)
         train_scaled_full = flat_scaled.reshape(train_data.shape)  # [S, N, 6]
 
-        # keep dynamic only as separate tensor
         train_dyn_scaled = flat_dyn_scaled.reshape(n_snaps, n_points, n_features_dyn)
 
         # bounds in physical space (for clipping)
@@ -263,120 +291,48 @@ def run_lagrangian_ml_pipeline(config, log_time):
         train_max = flat_dyn.max(axis=0)
 
     # ==============================================================
-    # 3. BASELINE: ALWAYS BUILD baseline_dyn_scaled FOR THIS RUN
+    # 3. BUILD AUGMENTED PARAMS: [params_phys, t_norm]
     # ==============================================================
 
-    print(f"[INFO] Lagrangian baseline (scaled) will be written to: {baseline_path}")
+    t_min = float(train_times.min())
+    t_max = float(train_times.max())
+    if t_max > t_min:
+        t_norm = (train_times - t_min) / (t_max - t_min)
+    else:
+        t_norm = np.zeros_like(train_times)
+    t_norm = t_norm.astype(np.float32).reshape(-1, 1)      # [S, 1]
 
-    # If an old baseline file exists from a previous run with different
-    # rev_dirs / snapshot count, remove it to avoid confusion.
-    if os.path.exists(baseline_path):
-        print(f"[INFO] Removing stale baseline file at {baseline_path}")
-        try:
-            os.remove(baseline_path)
-        except Exception as e:
-            print(f"[WARN] Failed to remove old baseline file: {e}")
-
-    poly_deg    = getattr(config, "lagrangian_baseline_poly_deg", 1)
-    ridge_alpha = getattr(config, "lagrangian_baseline_ridge_alpha", 1e-6)
-    atol        = getattr(config, "lagrangian_baseline_atol", 1e-8)
-
-    with log_time("Fitting baseline model on full training set"):
-        # NOTE: baseline uses *physical* params only (no time column).
-        baseline_model, meta = build_lagrangian_baseline_model_all4(
-            train_times=train_times,
-            params_all=params_all_phys,
-            train_data=train_data,  # physical [S, N, 6]
-            poly_deg=poly_deg,
-            ridge_alpha=ridge_alpha,
-            atol=atol,
-        )
-
-        # Minimal layout info for baseline scaling
-        ref_layout = {
-            "N": n_points,
-            "n_dyn_channels": n_features_dyn,
-        }
-
-        # optional: save baseline model for debugging/inspection
-        baseline_model_path = os.path.join(config.model_dir, "baseline_model.pkl")
-        try:
-            joblib.dump(baseline_model, baseline_model_path)
-            print(f"[INFO] Saved baseline model to {baseline_model_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save baseline model to {baseline_model_path}: {e}")
-
-    with log_time("Evaluating baseline (scaled) on training set"):
-        build_lagrangian_baseline_dyn_scaled_all4(
-            baseline_model,
-            infer_times=train_times,
-            params_infer=params_all_phys,
-            scaler=scaler,
-            ref_layout=ref_layout,
-            n_points=train_data.shape[1],
-            out_path=baseline_path,
-        )
-
-    baseline_dyn_scaled = np.load(baseline_path)
-
-    if baseline_dyn_scaled.shape != (n_snaps, n_points, n_features_dyn):
-        raise ValueError(
-            f"[Lagrangian] Newly built baseline_dyn_scaled shape {baseline_dyn_scaled.shape} "
-            f"does not match expected {(n_snaps, n_points, n_features_dyn)}"
-        )
-
-    # ==============================================================
-    # 4. RESIDUAL IN SCALED SPACE: CFD_dyn_scaled - baseline_dyn_scaled
-    # ==============================================================
-
-    resid_dyn_scaled = train_dyn_scaled - baseline_dyn_scaled  # [S, N, 4]
-
-    # ---- Sanity check: algebraic reconstruction ----
-    recon_train_dyn_scaled = baseline_dyn_scaled + resid_dyn_scaled   # [S, N, 4]
-    err_recon = train_dyn_scaled - recon_train_dyn_scaled             # [S, N, 4]
-
-    recon_rmse = np.sqrt(np.mean(err_recon**2))
-    recon_max = np.max(np.abs(err_recon))
+    params_aug = np.concatenate([params_all, t_norm], axis=1).astype(np.float32)
+    param_dim_aug = params_aug.shape[1]
+    config.param_dim_aug = param_dim_aug
 
     print(
-        f"[CHECK] Algebraic recon (train_dyn_scaled baseline + resid): "
-        f"RMSE={recon_rmse:.3e}, max|err|={recon_max:.3e}"
-    )
-
-    # Debug: baseline-only error (scaled space)
-    resid_flat = resid_dyn_scaled.reshape(-1, n_features_dyn)
-    baseline_mse = np.mean(resid_flat ** 2)
-    baseline_rmse = np.sqrt(baseline_mse)
-    print(
-        f"[DEBUG] Baseline-only MSE (scaled) = {baseline_mse:.4e}, "
-        f"RMSE = {baseline_rmse:.4e}"
+        f"[INFO] Built augmented params with shape {params_aug.shape} "
+        f"(P_phys={param_dim_phys}, +1 time coord)."
     )
 
     # ==============================================================
-    # 5. TRAIN OR LOAD RESIDUAL DECODER (baseline + params_phys+time -> residual)
+    # 4. AE TRAINING: PointNetAutoencoder(x_dyn_scaled | params_aug)
     # ==============================================================
 
     skip_training = getattr(config, "skip_training", False)
-    latent_dim = getattr(config, "latent_dim", 256)
 
-    model = PointNetResidualDecoder(
-        in_dim=4,                 # baseline dynamic features
-        param_dim=param_dim_resid,  # global params for decoder: [params_phys, t_norm]
-        latent_dim=latent_dim,
+    ae_model = PointNetAutoencoder(
+        in_dim=4,
         out_dim=4,
+        latent_dim=latent_dim,
+        param_dim=param_dim_aug,   # condition on [params_phys, t_norm]
     ).to(device)
 
     if skip_training and os.path.exists(model_path):
-        with log_time("Loading pretrained residual decoder"):
-            print(f"[INFO] Loading residual decoder from {model_path}")
+        with log_time("Loading pretrained Lagrangian AE"):
+            print(f"[INFO] Loading Lagrangian AE model from {model_path}")
             state_dict = torch.load(model_path, map_location=device)
-            model.load_state_dict(state_dict)
+            ae_model.load_state_dict(state_dict)
     else:
-        # build dataset & loaders, using augmented params_all_resid
-        full_dataset = BaselineResidualDataset(
-            baseline_dyn_scaled=baseline_dyn_scaled,
-            params_all=params_all_resid,         # NOTE: includes time
-            resid_dyn_scaled=resid_dyn_scaled,
+        full_dataset = SnapshotParamDatasetLagrangian(
+            dyn_scaled=train_dyn_scaled,   # [S, N, 4]
+            params_aug=params_aug,         # [S, P_aug]
         )
 
         indices = np.arange(len(full_dataset))
@@ -394,170 +350,114 @@ def run_lagrangian_ml_pipeline(config, log_time):
             val_subset, batch_size=batch_size, shuffle=False, drop_last=False
         )
 
-        from cpfd_rom.ml_rom.rom_lagrangian_ml.training import (
-            train_pointnet_residual_torch,
-        )
-
-        with log_time("Training residual decoder (baseline+params+time -> residual)"):
-            print("[INFO] Training PointNet residual decoder...")
-            model = train_pointnet_residual_torch(
-                model,
+        with log_time("Training PointNet AE (params+time-conditioned)"):
+            print("[INFO] Training PointNet autoencoder...")
+            ae_model = train_pointnet_torch(
+                ae_model,
                 train_loader,
                 val_loader,
-                device,
+                device=device,
                 epochs=epochs,
                 lr=lr,
                 patience=patience,
             )
 
         # save model + scaler
-        torch.save(model.state_dict(), model_path)
+        torch.save(ae_model.state_dict(), model_path)
         joblib.dump(scaler, scaler_path)
-        print(f"[INFO] Saved residual decoder to {model_path}")
+        print(f"[INFO] Saved AE model to {model_path}")
         print(f"[INFO] Saved scaler to {scaler_path}")
 
         # optional TorchScript export
         try:
-            model.eval()
-            example_baseline = torch.randn(1, n_points, 4, device=device)
-            example_params = torch.randn(1, param_dim_resid, device=device)
-            scripted = torch.jit.trace(model, (example_baseline, example_params))
+            ae_model.eval()
+            example_x = torch.randn(1, n_points, 4, device=device)
+            example_p = torch.randn(1, param_dim_aug, device=device)
+            scripted = torch.jit.trace(ae_model, (example_x, example_p))
             scripted.save(script_path)
-            print(f"[INFO] Saved TorchScript residual decoder to {script_path}")
+            print(f"[INFO] Saved TorchScript Lagrangian AE to {script_path}")
         except Exception as e:
             print(f"[WARN] TorchScript export failed: {e}")
 
-    model.eval()
+    ae_model.eval()
 
     # ==============================================================
-    # 5b. DIAGNOSTIC: residual model training-set error (UNWEIGHTED)
+    # 5. INFERENCE AT user_parameter (nearest training param)
     # ==============================================================
 
-    with torch.no_grad():
-        B_all = torch.from_numpy(baseline_dyn_scaled).float().to(device)    # [S, N, 4]
-        P_all = torch.from_numpy(params_all_resid).float().to(device)       # [S, P_resid]
-        R_true_all = torch.from_numpy(resid_dyn_scaled).float().to(device)  # [S, N, 4]
-
-        S_total = B_all.shape[0]
-        batch_diag = getattr(config, "diagnostic_batch_size", 32)
-
-        mse_sum = 0.0
-        count = 0
-
-        for s0 in range(0, S_total, batch_diag):
-            B_b = B_all[s0 : s0 + batch_diag]   # [B, N, 4]
-            P_b = P_all[s0 : s0 + batch_diag]   # [B, P_resid]
-            R_b = R_true_all[s0 : s0 + batch_diag]
-
-            R_pred_b = model(B_b, P_b)          # [B, N, 4]
-
-            mse_b = F.mse_loss(R_pred_b, R_b, reduction="mean").item()
-            mse_sum += mse_b * B_b.shape[0]
-            count += B_b.shape[0]
-
-        if count > 0:
-            mse_mean = mse_sum / count
-            rmse_mean = float(np.sqrt(mse_mean))
-            print(
-                f"[CHECK] Residual model train MSE (unweighted, scaled) = {mse_mean:.4e}, "
-                f"RMSE = {rmse_mean:.4e}"
-            )
-        else:
-            print("[CHECK] Residual model diagnostic: no batches?")
-
-    # ==============================================================
-    # 6. INFERENCE AT UNSEEN PARAMETER (config.user_parameter)
-    # ==============================================================
-
-    with log_time("Running Lagrangian inference at unseen user_parameter"):
-        # ---------- 1) Unique time grid (201 times) ----------
+    with log_time("Running Lagrangian AE inference at user_parameter"):
         n_revs = len(config.rev_dirs)
-        snaps_per_rev = n_snaps // n_revs   # e.g. 1005 // 5 = 201
+        snaps_per_rev = n_snaps // n_revs  # assume equal snapshots per rev
 
-        # All rev_dirs share the same time instants; first 201 belong to Rev1
-        times_unique = train_times[:snaps_per_rev].copy()      # [201]
-
-        # ---------- 2) Build param arrays for user_parameter ----------
+        # Choose nearest training param group to user_parameter
         infer_param = getattr(config, "user_parameter", None)
         if infer_param is None:
             raise ValueError(
-                "[Lagrangian] config.user_parameter must be set for unseen-parameter inference."
+                "[Lagrangian] config.user_parameter must be set for inference."
             )
 
-        # user_parameter is in *physical* param space only (no time)
-        infer_param_vec_phys = np.atleast_1d(infer_param).astype(np.float32)   # [P_phys]
-        P_phys = infer_param_vec_phys.shape[0]
-        if P_phys != param_dim_phys:
+        infer_param_vec = np.atleast_1d(infer_param).astype(np.float32)  # [P_phys]
+        if infer_param_vec.shape[0] != param_dim_phys:
             raise ValueError(
-                f"[Lagrangian] user_parameter dim {P_phys} does not match param_dim_phys {param_dim_phys}"
+                f"[Lagrangian] user_parameter dim {infer_param_vec.shape[0]} "
+                f"does not match param_dim_phys {param_dim_phys}"
             )
 
-        # 201 copies of the same physical param vector => [201, P_phys]
-        params_infer_phys = np.repeat(infer_param_vec_phys[None, :], snaps_per_rev, axis=0)
-
-        # Normalized time for the inference time grid, using the same scaling
-        # as training (t_min, t_max).
-        if t_max > t_min:
-            t_norm_inf = (times_unique - t_min) / (t_max - t_min)
-        else:
-            t_norm_inf = np.zeros_like(times_unique)
-        t_norm_inf = t_norm_inf.astype(np.float32).reshape(-1, 1)   # [201, 1]
-
-        # Augmented params for residual inference: [params_phys, t_norm_inf]
-        params_infer_resid = np.concatenate(
-            [params_infer_phys.astype(np.float32), t_norm_inf],
-            axis=1,
-        )  # [201, P_phys+1]
-
-        # ---------- 3) Evaluate baseline at (times_unique, user_parameter_phys) ----------
-        baseline_user_path = os.path.join(
-            config.model_dir, "baseline_dyn_scaled_user_param.npy"
-        )
-        build_lagrangian_baseline_dyn_scaled_all4(
-            baseline_model,
-            infer_times=times_unique,
-            params_infer=params_infer_phys,   # baseline uses physical params only
-            scaler=scaler,
-            ref_layout=ref_layout,
-            n_points=train_data.shape[1],
-            out_path=baseline_user_path,
+        # Find nearest unique parameter (rev) in L2 sense
+        dists = np.linalg.norm(unique_params - infer_param_vec[None, :], axis=1)
+        best_group = int(np.argmin(dists))
+        print(
+            f"[INFO] Nearest training parameter group index = {best_group}, "
+            f"distance = {dists[best_group]:.3e}"
         )
 
-        # Load baseline in SCALED space for the unseen param
-        baseline_dyn_scaled_inf = np.load(baseline_user_path)            # [201, N, 4]
+        # Assume rev_dirs are ordered such that each unique param corresponds
+        # to a block of snapshots of length snaps_per_rev.
+        if n_param_groups != n_revs:
+            print(
+                "[WARN] n_param_groups != n_revs; inference rev mapping may be approximate."
+            )
+        rev_idx = min(best_group, n_revs - 1)
 
-        S_inf, N_inf, _ = baseline_dyn_scaled_inf.shape
+        s0 = rev_idx * snaps_per_rev
+        s1 = s0 + snaps_per_rev
+        print(f"[INFO] Using snapshots [{s0}:{s1}] for inference.")
+
+        # Inputs for this rev
+        dyn_scaled_infer = train_dyn_scaled[s0:s1]   # [T, N, 4]
+        params_aug_infer = params_aug[s0:s1]         # [T, P_aug]
+        times_unique = train_times[s0:s1].copy()     # [T]
+        ids = train_data[s0:s1, :, 4:]               # [T, N, 2]
+
+        # Run AE
+        preds_scaled_list = []
         infer_batch_size = getattr(config, "infer_batch_size", batch_size)
 
-        preds_resid_scaled_list = []
-
         with torch.no_grad():
-            B_all_inf = torch.from_numpy(baseline_dyn_scaled_inf).float().to(device)  # [201, N, 4]
-            p_all_inf = torch.from_numpy(params_infer_resid).float().to(device)       # [201, P_resid]
+            for b_start in range(0, dyn_scaled_infer.shape[0], infer_batch_size):
+                x_b = torch.from_numpy(
+                    dyn_scaled_infer[b_start:b_start + infer_batch_size]
+                ).float().to(device)  # [B, N, 4]
 
-            for b_start in range(0, S_inf, infer_batch_size):
-                B_b = B_all_inf[b_start : b_start + infer_batch_size]  # [B, N, 4]
-                p_b = p_all_inf[b_start : b_start + infer_batch_size]  # [B, P_resid]
-                R_pred_b = model(B_b, p_b)                             # [B, N, 4]
-                preds_resid_scaled_list.append(R_pred_b.cpu().numpy())
+                p_b = torch.from_numpy(
+                    params_aug_infer[b_start:b_start + infer_batch_size]
+                ).float().to(device)  # [B, P_aug]
 
-        preds_resid_scaled = np.concatenate(preds_resid_scaled_list, axis=0)      # [201, N, 4]
+                recon_b, _ = ae_model(x_b, params=p_b)  # [B, N, 4]
+                preds_scaled_list.append(recon_b.cpu().numpy())
 
-    # ---------- 6) Combine baseline + residual (scaled) ----------
-    dyn_scaled_full = baseline_dyn_scaled_inf + preds_resid_scaled                # [201, N, 4]
+        dyn_scaled_full = np.concatenate(preds_scaled_list, axis=0)  # [T, N, 4]
 
     # ==============================================================
-    # 7. INVERSE SCALING, CLIPPING, APPEND IDs, GEOMETRY, WRITE
+    # 6. INVERSE SCALING, CLIPPING, GEOMETRY, WRITE
     # ==============================================================
 
     flat_pred = dyn_scaled_full.reshape(-1, 4)
     flat_pred_unscaled = scaler.inverse_transform(flat_pred)
     flat_pred_clipped = np.clip(flat_pred_unscaled, train_min, train_max)
-    pred_dyn = flat_pred_clipped.reshape(dyn_scaled_full.shape)                   # [201, N, 4]
+    pred_dyn = flat_pred_clipped.reshape(dyn_scaled_full.shape)      # [T, N, 4]
 
-    # Reuse IDs from first Rev only (layout is identical across rev_dirs)
-    ids = train_data[:snaps_per_rev, :, 4:]                                       # [201, N, 2]
-    pred_array = np.concatenate([pred_dyn, ids], axis=-1)                         # [201, N, 6]
+    pred_array = np.concatenate([pred_dyn, ids], axis=-1)            # [T, N, 6]
 
     with log_time("Writing Lagrangian ROM output"):
         rom_out_dir = getattr(config, "rom_output_dir_lagrangian", None)
@@ -588,7 +488,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
         columns_dir = Path(config.rev_dirs[0])
         write_lagrangian_rom_only(
             preds=pred_array,
-            times=times_unique,          # 201 time instants
+            times=times_unique,
             columns_dir=columns_dir,
             out_dir=Path(rom_out_dir),
             field_var=field_var,

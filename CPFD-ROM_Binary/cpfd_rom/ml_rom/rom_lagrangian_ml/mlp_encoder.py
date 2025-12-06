@@ -143,8 +143,10 @@ class PointNetAutoencoder(nn.Module):
         z, per_point_feat = self.encoder(x, mask=mask)
         recon = self.decoder(per_point_feat, x, z, params)
         return recon, z
+
+
 # ----------------------------------------------------------------------
-# NEW: Residual Decoder for Baseline + Residual ROM
+# Residual Decoder for Baseline + Residual ROM
 # ----------------------------------------------------------------------
 
 class PointNetResidualDecoder(nn.Module):
@@ -247,8 +249,9 @@ class PointNetResidualDecoder(nn.Module):
         return resid_pred
 
 
-
-# Optional: you can place this in a separate file if you prefer.
+# ----------------------------------------------------------------------
+# GAT-based residual decoder on COARSE centroid graph (K nodes)
+# ----------------------------------------------------------------------
 try:
     from torch_geometric.nn import GATConv
 except ImportError as e:
@@ -260,30 +263,38 @@ except ImportError as e:
 
 class PointNetGATResidualDecoder(nn.Module):
     """
-    GAT-based residual decoder for Lagrangian ROM.
+    GAT-based residual decoder for Lagrangian ROM on a *coarsened* graph.
+
+    This implementation assumes:
+      - You have already coarsened parcels to K centroids (e.g. via K-means).
+      - You have a static centroid graph: edge_index_single [2, E] for K nodes.
+      - The same centroid graph is reused across batches, rev dirs, and time.
 
     Inputs
     ------
-    baseline_dyn : torch.Tensor
-        Shape [B, N, 4]; dynamic baseline features [x, y, z, field] in *scaled* space.
+    baseline_dyn_nodes : torch.Tensor
+        Shape [B, K, 4]; baseline dynamic features in scaled space for each
+        coarse node (centroid). Typically aggregated from parcels.
     params : torch.Tensor
         Shape [B, P]; global parameters per snapshot (e.g., inlet velocity).
 
     Output
     ------
-    residual_dyn : torch.Tensor
-        Shape [B, N, 4]; predicted residual (scaled) to be added to baseline_dyn.
+    residual_dyn_nodes : torch.Tensor
+        Shape [B, K, 4]; predicted residual (scaled) to be added to the
+        baseline node features, to then be prolonged back to parcels.
     """
 
     def __init__(
         self,
-        in_dim: int = 4,      # baseline dynamic channels [x,y,z,field]
-        param_dim: int = 1,   # number of global params (P)
+        in_dim: int = 4,        # baseline dynamic channels [x,y,z,field] at nodes
+        param_dim: int = 1,     # number of global params (P)
         hidden_dim: int = 64,
         gat_heads: int = 4,
         num_gat_layers: int = 3,
-        out_dim: int = 4,     # residual dynamic channels
-        k_neighbors: int = 12,
+        out_dim: int = 4,       # residual dynamic channels
+        num_nodes: int = 2000,  # K (e.g., 2000 centroids)
+        edge_index: torch.Tensor | None = None,   # [2, E] for single graph
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -292,7 +303,26 @@ class PointNetGATResidualDecoder(nn.Module):
         self.gat_heads = gat_heads
         self.num_gat_layers = num_gat_layers
         self.out_dim = out_dim
-        self.k_neighbors = k_neighbors
+        self.num_nodes = num_nodes
+
+        if edge_index is None:
+            raise ValueError(
+                "PointNetGATResidualDecoder requires a precomputed edge_index "
+                "[2, E] for the centroid graph. None was provided."
+            )
+
+        # store single-graph edge_index as buffer so it moves with .to(device)
+        edge_index = edge_index.long()
+        if edge_index.dim() != 2 or edge_index.shape[0] != 2:
+            raise ValueError(
+                f"edge_index must have shape [2, E], got {edge_index.shape}"
+            )
+        if int(edge_index.max()) >= num_nodes:
+            raise ValueError(
+                f"edge_index contains node index >= num_nodes={num_nodes} "
+                f"(max index = {int(edge_index.max())})"
+            )
+        self.register_buffer("edge_index_single", edge_index, persistent=True)
 
         # Node input features = baseline_dyn(4) + params_broadcast(P)
         node_in_dim = in_dim + param_dim
@@ -305,10 +335,10 @@ class PointNetGATResidualDecoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # GAT layers (on node features; graph built from particle coordinates)
+        # GAT layers on node features; graph structure given by edge_index
         gat_layers = []
         in_channels = hidden_dim
-        for li in range(num_gat_layers):
+        for _ in range(num_gat_layers):
             gat = GATConv(
                 in_channels=in_channels,
                 out_channels=hidden_dim,
@@ -326,103 +356,71 @@ class PointNetGATResidualDecoder(nn.Module):
             nn.Linear(hidden_dim, out_dim),
         )
 
-    # ------------------------------------------------------------------
-    # Helper: build k-NN graph per batch using coordinates from baseline
-    # ------------------------------------------------------------------
-    def _build_knn_graph(self, pos: torch.Tensor):
+    def _expand_edges_for_batch(self, batch_size: int) -> torch.Tensor:
         """
-        pos : [B, N, 3] coordinates (x,y,z).
-        Returns:
-            edge_index : [2, E_total] concatenated over batch with proper offsets
-            batch_vec  : [B*N] batch index for each node (for torch_geometric)
-        NOTE: This is O(B * N^2) naive. For production, replace with
-              precomputed edges or a better kNN implementation.
+        Take the single-graph edge_index_single (for K nodes) and replicate it
+        for a batch of size B, offsetting node indices by b * K so we end up
+        with a disjoint union of B graphs.
+
+        Returns
+        -------
+        edge_index_batched : [2, B * E]
         """
-        B, N, _ = pos.shape
-        device = pos.device
+        K = self.num_nodes
+        edge_index = self.edge_index_single  # [2, E]
+        E = edge_index.shape[1]
 
-        all_src = []
-        all_dst = []
-        all_batch = []
+        # Create offsets [0, K, 2K, ..., (B-1)*K] on device
+        device = edge_index.device
+        offsets = torch.arange(batch_size, device=device, dtype=torch.long) * K  # [B]
 
-        for b in range(B):
-            # (N,3)
-            p = pos[b]  # [N,3]
-            # Compute pairwise distances (N,N) - naive; OK as a sketch
-            with torch.no_grad():
-                dists = torch.cdist(p, p, p=2)  # [N,N]
-                # For each node, get k+1 nearest (including self)
-                knn = torch.topk(dists, k=self.k_neighbors + 1, largest=False).indices  # [N, k+1]
+        # edge_index[None, ...] : [1, 2, E] -> broadcast with offsets[:,None,None]
+        edge_index_expanded = edge_index.unsqueeze(0) + offsets.view(batch_size, 1, 1)
+        # Now shape [B, 2, E]; reshape to [2, B*E]
+        edge_index_batched = edge_index_expanded.permute(1, 0, 2).reshape(2, -1)
+        return edge_index_batched
 
-            # Exclude self (index 0 in knn row)
-            nbrs = knn[:, 1:]  # [N, k]
-
-            src = torch.arange(N, device=device).unsqueeze(1).expand_as(nbrs)  # [N,k]
-            dst = nbrs
-
-            src = src.reshape(-1)
-            dst = dst.reshape(-1)
-
-            # Offset node indices by batch
-            offset = b * N
-            src = src + offset
-            dst = dst + offset
-
-            all_src.append(src)
-            all_dst.append(dst)
-            all_batch.append(torch.full((N,), b, dtype=torch.long, device=device))
-
-        edge_src = torch.cat(all_src, dim=0)
-        edge_dst = torch.cat(all_dst, dim=0)
-        edge_index = torch.stack([edge_src, edge_dst], dim=0)  # [2, E_total]
-        batch_vec = torch.cat(all_batch, dim=0)                # [B*N]
-
-        return edge_index, batch_vec
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
     def forward(self, baseline_dyn: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
-        baseline_dyn : [B, N, 4]
+        baseline_dyn : [B, K, 4]
         params       : [B, P]
-        returns residual_dyn : [B, N, 4]
+        returns residual_dyn : [B, K, 4]
         """
-        B, N, C = baseline_dyn.shape
+        B, K, C = baseline_dyn.shape
         assert C == self.in_dim, f"Expected in_dim={self.in_dim}, got {C}"
+        assert K == self.num_nodes, (
+            f"baseline_dyn has K={K} nodes, expected num_nodes={self.num_nodes}"
+        )
         P = params.shape[1]
         assert P == self.param_dim, f"Expected param_dim={self.param_dim}, got {P}"
 
-        device = baseline_dyn.device
-
-        # 1) Node features: concat baseline_dyn + params_broadcast -> [B,N,4+P]
-        params_expanded = params.unsqueeze(1).expand(B, N, P)        # [B,N,P]
-        node_feats = torch.cat([baseline_dyn, params_expanded], dim=-1)  # [B,N,4+P]
+        # 1) Node features: concat baseline_dyn + params_broadcast -> [B,K,4+P]
+        params_expanded = params.unsqueeze(1).expand(B, K, P)               # [B,K,P]
+        node_feats = torch.cat([baseline_dyn, params_expanded], dim=-1)     # [B,K,4+P]
 
         # 2) Encode node features
-        node_feats = self.node_encoder(node_feats)                   # [B,N,H]
+        node_feats = self.node_encoder(node_feats)                          # [B,K,H]
 
-        # 3) Build graph using positions from baseline_dyn (x,y,z)
-        pos = baseline_dyn[..., :3]  # [B,N,3]
-        edge_index, batch_vec = self._build_knn_graph(pos)          # [2,E], [B*N]
+        # 3) Flatten nodes for torch_geometric: [B*K, H]
+        x = node_feats.reshape(B * K, self.hidden_dim)                      # [B*K,H]
 
-        # Flatten nodes for torch_geometric: [B*N, H]
-        x = node_feats.reshape(B * N, self.hidden_dim)
+        # 4) Build batched edge_index for B disjoint copies of the centroid graph
+        edge_index = self._expand_edges_for_batch(B)                        # [2,B*E]
 
-        # 4) Apply stacked GAT layers
+        # 5) Apply stacked GAT layers
         for gat in self.gat_layers:
             x = gat(x, edge_index)
             x = F.relu(x, inplace=True)
 
-        # 5) Map back to residual dyn features
-        x = self.out_mlp(x)                     # [B*N, out_dim]
-        residual_dyn = x.view(B, N, self.out_dim)  # [B,N,4]
+        # 6) Map back to residual dyn features
+        x = self.out_mlp(x)                                                 # [B*K,4]
+        residual_dyn = x.view(B, K, self.out_dim)                           # [B,K,4]
 
         return residual_dyn
+
 
 __all__ = [
     "PointNetAutoencoder",
     "PointNetResidualDecoder",
-    "PointNetGATResidualDecoder"
+    "PointNetGATResidualDecoder",
 ]
-
