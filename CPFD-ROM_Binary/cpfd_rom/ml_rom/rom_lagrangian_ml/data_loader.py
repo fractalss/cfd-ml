@@ -1,129 +1,128 @@
 # cpfd_rom/ml_rom/rom_lagrangian_ml/data_loader.py
-"""Lagrangian snapshot loader for PointNet ROM.
-
-This module is intentionally lightweight: it only knows how to load
-per-snapshot particle data from Rev*_npy directories and stack them
-into a single array. The semantic meaning and ordering of the feature
-channels is enforced at a higher level (pipeline + columns.txt), but we
-assume the following for the current Lagrangian ROM:
-
-    Each npy file has shape [n_points, n_features] with
-        n_features = 6
-
-    and the features are ordered as:
-        [x, y, z, field_variable, CloudID, CloudID_base]
-
-This matches the expectations in:
-     pipeline.py   scaling only the first 4 dynamic features and
-                     carrying the last 2 IDs through unchanged.
-     evaluation.py  writing out the 6 columns in Tecplot-style
-                      particles_*.txt using columns.txt as the
-                      authoritative header.
-
-If in future you change the number or ordering of features in the
-npy snapshots, you must update both this expectation and the
-corresponding logic in pipeline.py and evaluation.py.
-"""
 
 import os
 import numpy as np
+import torch
+from torch_geometric.data import Data
+from torch_geometric.nn import radius_graph
 import pandas as pd
-from tqdm import tqdm
 
 
-def _load_one_rev_npy(directory: str):
-    """Load times and npy snapshots from a single Rev*_npy directory.
-
-    Expected directory layout:
-
-        directory/
-            times.csv   (columns: filename, time)
-            *.npy       (each of shape [n_points, n_features])
-
-    For the current Lagrangian ROM, each NPY must have:
-        n_features = 6 ? [x, y, z, field, CloudID, CloudID_base]
-    but this function does not enforce or reorder columns; it only
-    verifies that each file has consistent [N, C] shape and returns
-    float32 arrays. The semantic checks happen in the pipeline.
+def load_lagrangian_snapshots_as_graphs(
+    rev_dirs,
+    base_data_dir,
+    param_mapping,
+    field_variable="Particle volume fraction",
+    radius=0.1,
+    sample_ratio=0.01  # New: float in (0, 1], default 1.0 (no sampling)
+):
     """
-    dir_path = os.path.abspath(directory)
+    Load Lagrangian particle snapshots from CFD runs and convert them into PyTorch Geometric (PyG) graph objects.
 
-    times_csv = os.path.join(dir_path, "times.csv")
-    if not os.path.exists(times_csv):
-        raise FileNotFoundError(f"[Lagrangian] times.csv not found in {dir_path}")
-
-    times_df = pd.read_csv(times_csv)
-    if "filename" not in times_df.columns or "time" not in times_df.columns:
-        raise ValueError(
-            f"[Lagrangian] times.csv in {dir_path} must have 'filename' and 'time' columns"
-        )
-
-    # Sort by time to ensure temporal ordering
-    times_df = times_df.sort_values(by="time").reset_index(drop=True)
-
-    times = []
-    data_list = []
-
-    for _, row in tqdm(
-        times_df.iterrows(),
-        total=len(times_df),
-        desc=f"Loading snapshots in {os.path.basename(dir_path)}",
-    ):
-        fname = row["filename"]
-        t = float(row["time"])  # <-- ensure type safety for downstream logic
-        npy_path = os.path.join(dir_path, fname)
-        if not os.path.exists(npy_path):
-            raise FileNotFoundError(
-                f"[Lagrangian] Expected npy file '{fname}' not found in {dir_path}"
-            )
-
-        arr = np.load(npy_path)  # shape: [n_points, n_features]
-        if arr.ndim != 2:
-            raise ValueError(
-                f"[Lagrangian] NPY file '{fname}' in {dir_path} does not have shape [N, C]; "
-                f"got {arr.shape}"
-            )
-
-        times.append(t)
-        # Store as float32 for PyTorch
-        data_list.append(arr.astype(np.float32))
-
-    # times: list[float], data_list: list[[N, C]]
-    times_arr = np.array(times, dtype=np.float32)
-    data_arr = np.stack(data_list, axis=0)  # [S, N, C]
-
-    return times_arr, data_arr
-
-
-def load_lagrangian_snapshots(directories):
-    """Load and combine Lagrangian particle data from multiple Rev*_npy directories.
+    Each graph represents a single snapshot with:
+        - Nodes: particles
+        - Node features: dynamic scalar field (e.g., particle volume fraction)
+        - Positions: (x, y, z)
+        - Edges: built using radius graph
+        - Graph-level features: [physical param, normalized time]
 
     Parameters
     ----------
-    directories : sequence of str
-        List of Rev*_npy directory paths, e.g. ["Rev1_npy", "Rev2_npy", ...].
+    rev_dirs : List[str]
+        Subdirectory names of Rev*_npy folders.
+    base_data_dir : str
+        Path to the root directory containing all Rev folders.
+    param_mapping : Dict[str, float]
+        Mapping from Rev subdir names (e.g. 'Rev1_npy') to physical parameter values.
+    field_variable : str
+        Name of the scalar field variable to extract.
+    radius : float
+        Radius threshold for building the edge graph.
+    sample_ratio : float
+        Proportion of snapshots to use from each folder (e.g., 0.1 for 10%).
 
     Returns
     -------
-    all_times : np.ndarray
-        1D array of length total_snaps with the solution time for each snapshot.
-    all_data : np.ndarray
-        3D array of shape [total_snaps, n_points, n_features]. For the
-        current ROM, n_features should be 6 and ordering must be
-        consistent across all directories.
+    graphs : List[Data]
+        List of PyG Data objects, each representing a graph per snapshot.
     """
+    all_graphs = []
     all_times = []
-    all_data = []
 
-    for directory in tqdm(directories, desc="Loading Lagrangian directories"):
-        times, data = _load_one_rev_npy(directory)
-        all_times.append(times)
-        all_data.append(data)
+    print("[DataLoader] Scanning time ranges...")
 
-    if not all_times:
-        raise RuntimeError("[Lagrangian] No snapshots loaded; check rev_dirs and paths.")
+    # Pass 1: Collect time range across all directories
+    for rev_dir in rev_dirs:
+        dir_path = os.path.join(base_data_dir, rev_dir)
+        times_csv_path = os.path.join(dir_path, "times.csv")
 
-    all_times_arr = np.concatenate(all_times, axis=0)
-    all_data_arr = np.concatenate(all_data, axis=0)
+        if not os.path.exists(times_csv_path):
+            raise FileNotFoundError(f"[DataLoader] Missing times.csv in: {dir_path}")
 
-    return all_times_arr, all_data_arr
+        times_df = pd.read_csv(times_csv_path)
+        if "time" not in times_df.columns or "filename" not in times_df.columns:
+            raise ValueError(f"[DataLoader] times.csv must contain 'time' and 'filename' columns in {dir_path}")
+
+        all_times.extend(times_df["time"].tolist())
+
+    t_min, t_max = min(all_times), max(all_times)
+    print(f"[DataLoader] Global time range: t_min={t_min:.4f}, t_max={t_max:.4f}")
+    if t_max == t_min:
+        raise ValueError("[DataLoader] Global time range is zero  all time values are identical.")
+
+    print("[DataLoader] Loading particle snapshots and constructing graphs...")
+
+    # Pass 2: Load snapshots and construct PyG graphs
+    for rev_dir in rev_dirs:
+        dir_path = os.path.join(base_data_dir, rev_dir)
+        rev_name = os.path.basename(rev_dir)
+        if rev_name not in param_mapping:
+            raise KeyError(f"[DataLoader] Missing param mapping for rev_dir '{rev_name}' in param_mapping.")
+
+        param_val = param_mapping[rev_name]
+
+        times_df = pd.read_csv(os.path.join(dir_path, "times.csv"))
+        times_df = times_df.sort_values("time")
+
+        # Sample only a fraction of snapshots
+        n_total = len(times_df)
+        n_sample = max(1, int(sample_ratio * n_total))
+        sampled_df = times_df.iloc[:: max(1, n_total // n_sample)]
+
+        for _, row in sampled_df.iterrows():
+            fname = row["filename"]
+            tval = row["time"]
+
+            if not (fname.startswith("particles") and fname.endswith(".npy")):
+                continue
+
+            fpath = os.path.join(dir_path, fname)
+            if not os.path.exists(fpath):
+                raise FileNotFoundError(f"[DataLoader] Snapshot file not found: {fpath}")
+
+            print(f"[DataLoader] Loading: {fpath}")
+            arr = np.load(fpath)
+            if arr.ndim != 2 or arr.shape[1] < 6:
+                raise ValueError(f"[DataLoader] Invalid shape in {fpath}, expected [N, 6+], got {arr.shape}")
+
+            pos = torch.tensor(arr[:, 0:3], dtype=torch.float32)
+            x_field = torch.tensor(arr[:, 3:4], dtype=torch.float32)
+            cloud_id = torch.tensor(arr[:, 4], dtype=torch.long)
+            cloud_id_base = torch.tensor(arr[:, 5], dtype=torch.long)
+
+            print(f"[DataLoader] Constructing radius graph (N={pos.size(0)}, radius={radius})")
+            edge_index = radius_graph(pos, r=radius, loop=False)
+            print(f"[DataLoader] Radius graph done. Edges: {edge_index.size(1)}")
+
+            data = Data(x=x_field, pos=pos, edge_index=edge_index)
+            data.time = torch.tensor([tval], dtype=torch.float32)
+            data.params = torch.tensor([param_val, (tval - t_min) / (t_max - t_min)], dtype=torch.float32)
+            data.cloud_id = cloud_id
+            data.cloud_id_base = cloud_id_base
+            data.snapshot_name = fname
+            data.rev_dir = rev_name
+
+            all_graphs.append(data)
+
+    print(f"[DataLoader] Total graphs loaded: {len(all_graphs)}")
+    return all_graphs
