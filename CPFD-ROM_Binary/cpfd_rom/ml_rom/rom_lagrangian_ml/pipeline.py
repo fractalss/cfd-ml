@@ -3,10 +3,16 @@ from pathlib import Path
 import torch
 import numpy as np
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_max_pool
 from sklearn.model_selection import train_test_split
 
-from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import load_lagrangian_snapshots_as_graphs
-from cpfd_rom.ml_rom.rom_lagrangian_ml.models.pointnet import PointNetAutoencoder
+from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
+    load_lagrangian_snapshots_as_graphs,
+    compute_feature_stats,
+    extract_scaffold_graphs,
+)
+
+from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import PointNetAutoencoder
 from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import GraphSnapshotDataset
 from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_torch
 from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
@@ -14,10 +20,10 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
     build_latent_regression_dataloaders,
     train_latent_regressor_torch,
 )
+from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import infer_pointnet_with_latent_regression
 from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
 from cpfd_rom.util.output_utils import setup_output_dir
 from cpfd_rom.util.model_utils import setup_model_paths
-
 
 def run_lagrangian_ml_pipeline(config, log_time):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,7 +35,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = os.path.join(config.model_dir, "pointnet_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
 
-    with log_time("Loading Lagrangian PyG graph snapshots"):
+    with log_time("Loading and normalizing graph snapshots (1-pass)"):
         graphs = load_lagrangian_snapshots_as_graphs(
             rev_dirs=config.rev_dirs,
             base_data_dir=config.base_data_dir,
@@ -37,13 +43,28 @@ def run_lagrangian_ml_pipeline(config, log_time):
             field_variable=config.field_variable,
             radius=getattr(config, "graph_radius", 0.01),
             sample_ratio=0.01,
+            feature_stats=None,
         )
+
+        feature_stats = compute_feature_stats(graphs)
+
+        for g in graphs:
+            if "x" in g and feature_stats.get("pos_mean") is not None:
+                g.x[:, :3] = (g.x[:, :3] - feature_stats["pos_mean"]) / (feature_stats["pos_std"] + 1e-8)
+            if "x" in g and feature_stats.get("field_min") is not None:
+                g.x[:, 3:4] = (g.x[:, 3:4] - feature_stats["field_min"]) / (
+                        feature_stats["field_max"] - feature_stats["field_min"] + 1e-8
+                )
+            if "y" in g:
+                g.y[:, :3] = (g.y[:, :3] - feature_stats["pos_mean"]) / (feature_stats["pos_std"] + 1e-8)
+                g.y[:, 3:4] = (g.y[:, 3:4] - feature_stats["field_min"]) / (
+                        feature_stats["field_max"] - feature_stats["field_min"] + 1e-8
+                )
 
     dataset = GraphSnapshotDataset(graphs)
     indices = list(range(len(dataset)))
     train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
     train_set = torch.utils.data.Subset(dataset, train_idx)
-    val_set = torch.utils.data.Subset(dataset, val_idx)
 
     batch_size = getattr(config, "batch_size", 32)
     latent_dim = getattr(config, "latent_dim", 64)
@@ -55,18 +76,16 @@ def run_lagrangian_ml_pipeline(config, log_time):
     latent_reg_weight_decay = getattr(config, "latent_reg_weight_decay", 1e-4)
     latent_reg_patience = getattr(config, "latent_reg_patience", 5)
     latent_reg_hidden_dims = getattr(config, "latent_reg_hidden_dims", [128, 64])
-    user_parameter = getattr(config, "user_parameter", None)
-    infer_timesteps = getattr(config, "infer_timesteps", 10)
-
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     sample = dataset[0]
-    param_dim = sample.params.shape[0]
+    param_dim = sample.params.shape[1]
 
-
-    model = PointNetAutoencoder(input_dim=1, param_dim=param_dim, latent_dim=latent_dim).to(device)
+    model = PointNetAutoencoder(
+        in_dim=4,
+        param_dim=param_dim,
+        latent_dim=latent_dim,
+        out_dim=4,
+    )
 
     if getattr(config, "skip_training", False) and os.path.exists(model_path):
         print(f"[INFO] Loading pretrained AE model from {model_path}")
@@ -74,21 +93,23 @@ def run_lagrangian_ml_pipeline(config, log_time):
     else:
         with log_time("Training PointNet Autoencoder"):
             model = train_pointnet_torch(
-                model, train_loader, val_loader,
+                model=model,
+                dataset=train_set,
+                device=device,
                 epochs=epochs,
                 lr=learning_rate,
+                batch_size=batch_size,
             )
         torch.save(model.state_dict(), model_path)
 
     model.eval()
 
-    # Latent regression phase
     latents, params_all = [], []
     with torch.no_grad():
-        for data in DataLoader(dataset, batch_size=config.batch_size):
-            data = data.to(device)
-            _, z = model(data.x, data.edge_index, data.edge_attr, data.batch, data.params)
-            latents.append(z.cpu())
+        for data in DataLoader(dataset, batch_size=batch_size):
+            x_feat = model.encoder_mlp(data.x.to(device))
+            latent = global_max_pool(x_feat, data.batch.to(device))
+            latents.append(latent.cpu())
             params_all.append(data.params.cpu())
 
     latents_all = torch.cat(latents, dim=0).numpy()
@@ -127,32 +148,31 @@ def run_lagrangian_ml_pipeline(config, log_time):
         torch.save(latent_reg_model.state_dict(), latent_reg_path)
 
     latent_reg_model.eval()
+    scaffold_graphs = extract_scaffold_graphs(
+        rev_dirs=config.rev_dirs,
+        base_data_dir=config.base_data_dir,
+        param_mapping=config.param_mapping,
+        param_train_array=params_all,
+        user_param_array=config.user_parameter,
+        field_variable=config.field_variable,
+        radius=getattr(config, "graph_radius", 0.01),
+        feature_stats=feature_stats,
+        sample_ratio=0.01
+    )
 
-    # Inference at user_parameter
-    infer_param = np.atleast_1d(config.user_parameter).astype(np.float32)
-    if infer_param.shape[0] != param_dim - 1:
-        raise ValueError("user_parameter dimensionality mismatch")
+    preds, times = infer_pointnet_with_latent_regression(
+        user_param=config.user_parameter,
+        model=model,
+        latent_regressor=latent_reg_model,
+        scaffold_graphs=scaffold_graphs,
+        output_dir=config.output_dir,
+        field_variable=config.field_variable,
+        feature_stats=feature_stats,
+        device=device
+    )
 
-    # Pick representative snapshot set from one Rev
-    ref_graphs = [g for g in graphs if torch.allclose(g.params[:-1], torch.tensor(infer_param, dtype=torch.float32), atol=1e-2)]
-    if not ref_graphs:
-        ref_graphs = graphs[:config.infer_timesteps]  # fallback to any Rev
-
-    pred_graphs = []
-    with torch.no_grad():
-        for g in ref_graphs:
-            t = g.params[-1].item()
-            p_aug = torch.tensor(np.append(infer_param, t), dtype=torch.float).unsqueeze(0).to(device)
-            z_pred = latent_reg_model(p_aug)
-            template = g.x.unsqueeze(0).to(device)
-            recon = model.decode(z_pred, template, params=p_aug)
-            out = recon.squeeze(0).cpu().numpy()
-
-            # re-attach IDs and metadata
-            pred_arr = torch.cat([recon.squeeze(0).cpu(), g.cloud_id.unsqueeze(1), g.cloud_id_base.unsqueeze(1)], dim=1).numpy()
-            pred_graphs.append((g.snapshot_name, pred_arr, t))
-
-    out_dir = os.path.join(config.rom_output_dir, "Lagrangian_ROM")
+    out_dir = os.path.join(config.output_dir, "Lagrangian_ROM")
     os.makedirs(out_dir, exist_ok=True)
-    write_lagrangian_rom_only(pred_graphs, out_dir, config.field_variable)
+
+    write_lagrangian_rom_only(preds, times, config.field_variable, out_dir)
     print(f"[INFO] ROM inference complete. Output saved to: {out_dir}")

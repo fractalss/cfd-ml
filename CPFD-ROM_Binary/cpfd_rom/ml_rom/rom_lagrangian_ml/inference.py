@@ -1,43 +1,39 @@
 # cpfd_rom/ml_rom/rom_lagrangian_ml/inference.py
 
+import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch_geometric.loader import DataLoader
+from .evaluation import write_lagrangian_rom_only
+from .datasets import GraphSnapshotDataset
+from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import PointNetAutoencoder
 
-from .datasets import SnapshotDataset
 
-def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None, scaler=None):
+def predict_pointnet_torch(
+    model,
+    data_scaled,
+    device,
+    batch_size=2,
+    params=None,
+    feature_stats=None
+):
     """
-    Run inference on scaled Lagrangian data using the PointNet autoencoder.
+    Direct prediction using PointNet autoencoder on scaled input data.
 
-     Input x has 6 features: [x, y, z, field, CloudID, CloudID_base]
-      Only the first 4 channels are used for prediction.
+    Args:
+        model (torch.nn.Module): Trained autoencoder model.
+        data_scaled (np.ndarray): Scaled input particle data [S, N, 6].
+        device (torch.device): Torch device.
+        batch_size (int): Batch size for inference.
+        params (np.ndarray): Optional conditioning parameters [S, D].
+        feature_stats (dict): Normalization statistics.
 
-     Output recon has shape [B, N, 6]: [x, y, z, field, CloudID, CloudID_base]
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        A PointNetAutoencoder with in_dim=6, out_dim=4.
-    data_scaled : np.ndarray
-        Scaled input of shape [num_snaps, n_points, 6].
-    device : torch.device
-        PyTorch device.
-    batch_size : int
-        Batch size.
-    params : np.ndarray or None
-        Optional [num_snaps, param_dim] array for conditioning.
-    scaler : StandardScaler or None
-        Scaler fitted on training data (for inverse_transform and clipping).
-
-    Returns
-    -------
-    final_output : np.ndarray
-        Reconstructed [x, y, z, field, CloudID, CloudID_base] of shape [num_snaps, n_points, 6].
+    Returns:
+        np.ndarray: Denormalized predicted output [S, N, 6].
     """
     model.eval()
-    dataset = SnapshotDataset(data_scaled)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataset = GraphSnapshotDataset(data_scaled)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     preds = []
     with torch.no_grad():
@@ -51,24 +47,86 @@ def predict_pointnet_torch(model, data_scaled, device, batch_size=2, params=None
             else:
                 p_batch = None
 
-            recon, _ = model(x, params=p_batch)  # recon: [B, N, 4]
+            recon = model(x, params=p_batch)
             preds.append(recon.cpu().numpy())
 
-    preds = np.concatenate(preds, axis=0)  # [S, N, 4]
+    preds = np.concatenate(preds, axis=0)
 
-    if scaler is not None:
-        flat = preds.reshape(-1, 4)
-        preds_inv = scaler.inverse_transform(flat).reshape(preds.shape)
-        # Clip each dynamic feature to training min/max
-        preds_clipped = np.clip(preds_inv, scaler.data_min_[:4], scaler.data_max_[:4])
+    if feature_stats is not None:
+        pos_mean = feature_stats["pos_mean"].cpu().numpy()
+        pos_std = feature_stats["pos_std"].cpu().numpy()
+        field_min = feature_stats["field_min"]
+        field_max = feature_stats["field_max"]
+
+        pos = preds[..., :3] * (pos_std + 1e-8) + pos_mean
+        field = preds[..., 3:4] * (field_max - field_min + 1e-8) + field_min
+        preds_denorm = np.concatenate([pos, field], axis=-1)
     else:
-        preds_clipped = preds
+        preds_denorm = preds
 
-    # Reattach CloudID and CloudID_base
     cloud_ids = data_scaled[..., 4:6]
-    final_output = np.concatenate([preds_clipped, cloud_ids], axis=-1)  # [S, N, 6]
+    final_output = np.concatenate([preds_denorm, cloud_ids], axis=-1)
 
     return final_output
 
+def infer_pointnet_with_latent_regression(
+    user_param: float,
+    model: torch.nn.Module,
+    latent_regressor: torch.nn.Module,
+    scaffold_graphs: list,
+    output_dir: str,
+    field_variable: str,
+    feature_stats: dict = None,
+    device: torch.device = torch.device("cpu"),
+    batch_size: int = 16,
+):
+    """
+    Inference using trained autoencoder and latent regressor with output denormalization.
 
-__all__ = ["predict_pointnet_torch"]
+    Args:
+        user_param (float): New parameter value for prediction.
+        model (torch.nn.Module): Trained PointNet autoencoder.
+        latent_regressor (torch.nn.Module): Trained latent regressor.
+        scaffold_graphs (list): List of graphs with spatial templates.
+        output_dir (str): Path to save results.
+        field_variable (str): Field variable name for saving output.
+        feature_stats (dict): Normalization statistics.
+        device (torch.device): Torch device.
+        batch_size (int): Batch size for inference.
+
+    Returns:
+        np.ndarray: Denormalized predicted particle states [S, N_i, 6].
+        list: List of simulation times.
+    """
+    model = model.to(device).eval()
+    latent_regressor = latent_regressor.to(device).eval()
+
+    loader = DataLoader(scaffold_graphs, batch_size=1, shuffle=False)
+    preds, times = [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            t_norm = batch.params[:, -1]
+            user_param_tensor = torch.full_like(t_norm, fill_value=user_param)
+            p_aug = torch.stack([user_param_tensor, t_norm], dim=1)
+
+            z_pred = latent_regressor(p_aug)
+            recon = model.decode(z_pred, batch.x[:, :4], batch.batch, p_aug)  # [N, 4]
+
+            pos = recon[:, :3]
+            field = recon[:, 3:4]
+
+            if feature_stats is not None:
+                pos = pos * (feature_stats["pos_std"].to(device) + 1e-8) + feature_stats["pos_mean"].to(device)
+                field = field * (feature_stats["field_max"] - feature_stats["field_min"] + 1e-8) + feature_stats["field_min"]
+
+            cloud_ids = batch.x[:, 4:6]
+            output = torch.cat([pos, cloud_ids, field], dim=1)  # [N, 6]
+
+            preds.append(output.cpu().numpy())
+            times.append(batch.time.item())
+
+    preds_np = np.stack(preds, axis=0)
+    return preds_np, times
