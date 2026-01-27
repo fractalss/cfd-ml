@@ -1,14 +1,10 @@
 import os
-import sys
 import gc
 import time
 from contextlib import contextmanager
 import argparse
 
 from cpfd_rom.util.config import load_config, overlay_cli
-from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import run_ml_rom_pipeline
-from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
-
 
 
 @contextmanager
@@ -40,10 +36,14 @@ def main():
     )
 
     # Accept both --config and --config_yaml for backward compatibility
-    parser.add_argument("--config", "--config_yaml", dest="config_path", required=True,
-                        help="Path to YAML file with all configuration options.")
+    parser.add_argument(
+        "--config", "--config_yaml",
+        dest="config_path",
+        required=True,
+        help="Path to YAML file with all configuration options.",
+    )
 
-    # Optional CLI overrides (Fix 1). We accept both snake_case and kebab-case aliases.
+    # Optional CLI overrides
     parser.add_argument("--add_time", "--add-time", dest="add_time", default=None)
     parser.add_argument("--time_mode", "--time-mode", dest="time_mode", default=None)
     parser.add_argument("--fourier_m", "--fourier-m", dest="fourier_m", type=int, default=None)
@@ -55,7 +55,7 @@ def main():
 
     clear_memory()
 
-    # Load YAML -> ROMConfig
+    # Load YAML -> ROMConfig (your dataclass/namespace)
     cfg = load_config(args.config_path)
 
     # Overlay CLI overrides (only those provided)
@@ -78,10 +78,10 @@ def main():
 
     # Prepend base_data_dir to rev_dirs if relative
     if getattr(cfg, "base_data_dir", None) and getattr(cfg, "rev_dirs", None):
-        rooted = []
-        for d in cfg.rev_dirs:
-            rooted.append(d if os.path.isabs(d) else os.path.join(cfg.base_data_dir, d))
-        cfg.rev_dirs = rooted
+        cfg.rev_dirs = [
+            d if os.path.isabs(d) else os.path.join(cfg.base_data_dir, d)
+            for d in cfg.rev_dirs
+        ]
 
     print(
         "[MAIN] Effective:",
@@ -91,13 +91,22 @@ def main():
         "conv_type=", getattr(cfg, "conv_type", None),
     )
 
-    # Route to the requested pipeline
-    if cfg.rom_type == "ML" and cfg.type_of_field == "Eulerian":
+    # -------------------------
+    # LAZY IMPORT + ROUTING
+    # -------------------------
+    rom_type = str(getattr(cfg, "rom_type", "")).strip()
+    field_type = str(getattr(cfg, "type_of_field", "")).strip()
+
+    if rom_type == "ML" and field_type == "Eulerian":
+        from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import run_ml_rom_pipeline
         run_ml_rom_pipeline(cfg, log_time)
-    elif cfg.rom_type == "ML" and cfg.type_of_field == "Lagrangian":
+
+    elif rom_type == "ML" and field_type == "Lagrangian":
+        from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
         run_lagrangian_ml_pipeline(cfg, log_time)
+
     else:
-        raise ValueError("Unsupported ROM type or field type in config.")
+        raise ValueError(f"Unsupported ROM type / field type: rom_type={rom_type}, type_of_field={field_type}")
 
     clear_memory()
 

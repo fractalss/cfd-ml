@@ -43,7 +43,7 @@ def convert_ascii_to_npy(input_dir, output_dir, field_variable):
         times.append({'filename': base_name, 'time': time})
 
         # Clean up memory
-        del df, array_data
+
 
     # Save time mapping CSV
     times_df = pd.DataFrame(times)

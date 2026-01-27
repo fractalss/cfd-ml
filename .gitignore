@@ -8,3 +8,16 @@
 *.pkl
 *.plt
 *.grd
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Cython/compiled artifacts
+*.c
+*.so
+*.pyd
+*.cpp
+# Python virtual environments
+venv/
+**/venv/
