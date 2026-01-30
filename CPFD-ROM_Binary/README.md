@@ -1,77 +1,62 @@
-# ROM Pipeline CLI
+1. **System Requirements**
+   - Linux (primary supported platform)
+   - Python 3.10+
+   - CUDA 12.112.2
+   - PyTorch 2.2.2 + cu121
+   - NVIDIA RTX / A-series / V100 / GV100 or newer recommended
 
-This project provides a command-line interface (CLI) to run Reduced Order Model (ROM) pipelines using machine learning or PCA-RBF-based techniques on Eulerian or Lagrangian CFD simulation data.
+2. **Installation (Wheel-Based)**
+   - Install using internal `.whl` file via `pip install`
+   - Optional user-local installation
+   - PATH setup if `rom-cli-bin` is not found
 
-## Installation
+3. **End-to-End Workflow Overview**
+   - Generate CFD training/test data (BVR)
+   - Export ASCII data
+   - Convert ASCII to binary
+   - Train, infer, and evaluate ROMs
 
-To install this project as a CLI tool:
+4. **Generate CFD Training and Test Data**
+   - Use Barracuda Virtual Reactor v25.1.1+
+   - Create multiple operating points (Rev1, Rev2, , Test1)
+   - Each directory corresponds to one operating condition
 
-```bash
-pip install -e .
-```
+5. **Export ASCII Data from Barracuda VR**
+   - Use BVR GUI ? Post-Run ? Quick Macro Panel
+   - Output all data to text
+   - Preserve native file naming conventions
 
-This will register the CLI command `rom-cli`.
+6. **Convert ASCII Data to Binary Format**
+   - Use provided data conversion utilities
+   - Configure `conversion_config.yaml`
+   - Generate `_npy` or other binary directories
 
-## Usage
+7. **Run the ROM CLI**
+   - Execute ROM pipelines using `rom-cli-bin`
+   - Driven entirely by YAML configuration
 
-```bash
-rom-cli --config_yaml path/to/rom_inputs.yaml
-```
+8. **YAML Configuration**
+   - Specify ROM type, field type, variables
+   - Define training directories and parameter mapping
+   - Control training, inference, and graph rebuilding
 
-## YAML Configuration
+9. **Output Directory Structure**
+   - ROM results written under `rom_output/`
+   - Separate directories for transient and time-averaged runs
 
-A sample `rom_inputs.yaml` file should define the following:
+10. **Post-Processing and Visualization**
+    - Convert ROM output to Tecplot format
+    - Load ROM and CFD data side-by-side for comparison
 
-```yaml
-rom_type: ML  # or PCA-RBF
-type_of_field: Eulerian  # or Lagrangian
-field_variable: Particle volume fraction
-user_velocity: 11
-target_times:
-  - 5.0
-  - 10.0
-  - 15.0
+11. **ROM Accuracy Evaluation**
+    - Compute correlation metrics
+    - Evaluate transient and time-averaged fidelity
+    - Generate plots and summary statistics
 
-base_data_dir: /path/to/data
-rev_dirs: ["Rev1", "Rev2", "Rev3"]
-vel_mapping:
-  Rev1: 10
-  Rev2: 12
-  Rev3: 14
-test_dir: Test_1
+12. **Project Structure**
+    - Modular layout for ML ROMs, PCA-RBF ROMs, utilities
+    - CLI entry point and configuration templates
 
-skip_training: true
-```
-
-## Output
-
-Model results, visualizations (e.g., RMSE plots, snapshot comparisons), and model files will be saved to subdirectories under `rom_output/` and `model_files/` inside `base_data_dir`.
-
-## Project Structure
-
-```
-CPFD-ROM/
-+-- rom_cli.py              # Entry point CLI
-+-- ml_rom/                 # ML-based ROMs
-+-- pca_rbf_rom/            # PCA-RBF ROMs
-+-- util/
-¦   +-- config.py
-¦   +-- io_utils.py
-¦   +-- lagrangian_io.py
-¦   +-- output_utils.py
-¦   +-- model_utils.py
-+-- setup.py                # CLI and pip installation setup
-+-- rom_inputs.yaml         # Sample configuration
-```
-
-## Development
-
-To run locally during development:
-
-```bash
-python rom_cli.py --config_yaml rom_inputs.yaml
-```
-
-## License
-
-MIT License
+13. **Support**
+    - Internal use only
+    - Author and contact information

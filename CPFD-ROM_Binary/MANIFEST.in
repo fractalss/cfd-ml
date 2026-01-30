@@ -1,2 +1,11 @@
 include rom_inputs.yaml
 include README.md
+global-exclude *.c
+global-exclude *.cpp
+global-exclude *.h
+global-exclude *.pyx
+global-exclude *.pxd
+prune build
+prune dist
+prune *.egg-info
+

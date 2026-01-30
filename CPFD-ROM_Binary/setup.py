@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
-from setuptools import setup, find_packages
+from pathlib import Path
+from setuptools import setup, find_packages, Extension
 from setuptools.command.build_py import build_py as _build_py
 from Cython.Build import cythonize
 
@@ -34,10 +35,18 @@ class build_py_strip_sources(_build_py):
                     if f.endswith(".py") and f != "__init__.py":
                         os.remove(os.path.join(root, f))
 
+# IMPORTANT: create Extension objects so we can control build behavior cleanly
+py_sources = list_py_files(PACKAGE_NAME)
+extensions = []
+for src in py_sources:
+    # convert "cpfd_rom/foo/bar.py" -> "cpfd_rom.foo.bar"
+    modname = Path(src).with_suffix("").as_posix().replace("/", ".")
+    extensions.append(Extension(modname, [src]))
 
 ext_modules = cythonize(
-    list_py_files(PACKAGE_NAME),
+    extensions,
     compiler_directives={"language_level": "3"},
+    build_dir="build/cython",     # <-- generated C goes here, NOT next to sources
 )
 
 setup(
@@ -65,5 +74,15 @@ setup(
         "networkx==3.5",
         "pyyaml==6.0.3",
     ],
+    extras_require={
+        "lagrangian": [
+            "torch-scatter",
+            "torch-sparse",
+            "torch-cluster",
+            "torch-spline-conv",
+        ]
+    },
     python_requires=">=3.10,<3.13",
+    # Wheel-time exclusion safety (belt + suspenders)
+    exclude_package_data={"": ["*.c", "*.cpp", "*.h", "*.pyx", "*.pxd"]},
 )
