@@ -8,15 +8,20 @@ from Cython.Build import cythonize
 
 PACKAGE_NAME = "cpfd_rom"
 VERSION = "0.3"
-
+KEEP_PY = {"rom_cli.py", "main_entry.py","api.py"}  # keep these as .py in wheel
 
 def list_py_files(base_dir: str):
     py_files = []
     for root, _, files in os.walk(base_dir):
         for f in files:
-            if f.endswith(".py") and f != "__init__.py":
-                py_files.append(os.path.join(root, f))
+            if not f.endswith(".py") or f == "__init__.py":
+                continue
+            # Do NOT cythonize the kept "entry" modules
+            if f in KEEP_PY:
+                continue
+            py_files.append(os.path.join(root, f))
     return py_files
+
 
 
 class build_py_strip_sources(_build_py):
@@ -32,7 +37,7 @@ class build_py_strip_sources(_build_py):
         if os.path.isdir(pkg_root):
             for root, _, files in os.walk(pkg_root):
                 for f in files:
-                    if f.endswith(".py") and f != "__init__.py":
+                    if f.endswith(".py") and f != "__init__.py" and f not in KEEP_PY:
                         os.remove(os.path.join(root, f))
 
 # IMPORTANT: create Extension objects so we can control build behavior cleanly
@@ -76,10 +81,10 @@ setup(
     ],
     extras_require={
         "lagrangian": [
-            "torch-scatter",
-            "torch-sparse",
-            "torch-cluster",
-            "torch-spline-conv",
+            "torch_scatter",
+            "torch_sparse",
+            "torch_cluster",
+            "torch_spline_conv",
         ]
     },
     python_requires=">=3.10,<3.13",
