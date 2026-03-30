@@ -1,7 +1,7 @@
 # cpfd_rom/ml_rom/rom_lagrangian_ml/data_loader.py
 
 from __future__ import annotations
-
+import os
 import re
 import time
 from pathlib import Path
@@ -31,12 +31,40 @@ RAW_REQUIRED_BASE = [
 RAW_PARTICLE_TIME_RE = re.compile(
     r"^Raw\.particle\.(?P<step>\d+)_(?P<time>[-+0-9.eE]+)\.(json|npy)$"
 )
-
-
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
+def _sample_sorted_sequence(seq, sample_ratio: float):
+    if sample_ratio >= 1.0:
+        return list(seq)
 
+    n_total = len(seq)
+    n_keep = max(1, int(round(n_total * sample_ratio)))
+    idx = np.linspace(0, n_total - 1, n_keep, dtype=int)
+    return [seq[i] for i in idx]
+def load_lagrangian_snapshot_times(
+    rev_dir: str,
+    base_data_dir: str,
+    sample_ratio: float = 1.0,
+) -> np.ndarray:
+    rev_path = os.path.join(base_data_dir, rev_dir)
+    files = [
+        os.path.join(rev_path, f)
+        for f in os.listdir(rev_path)
+        if f.startswith("Raw.particle.") and f.endswith(".json")
+    ]
+    files = sorted(files, key=lambda f: _time_from_raw_particle_filename(Path(f)))
+    if len(files) == 0:
+        raise RuntimeError(f"No Raw.particle JSON files found in {rev_path}")
+
+    if sample_ratio < 1.0:
+        files = _sample_sorted_sequence(files, sample_ratio)
+
+    times = np.array(
+        [_time_from_raw_particle_filename(Path(f)) for f in files],
+        dtype=np.float64,
+    )
+    return times
 def _list_raw_particle_jsons(dir_path: Path) -> list[Path]:
     """
     Return sorted list of Raw.particle.*.json files in a Rev directory.
@@ -281,7 +309,7 @@ def load_lagrangian_snapshots_as_graphs(
     base_data_dir,
     param_mapping,
     field_variable="Particle volume fraction",
-    radius=0.1,
+    radius=0.001,
     sample_ratio=1.0,
     feature_stats=None,
     verbose_timing: bool = False,
@@ -379,9 +407,7 @@ def load_lagrangian_snapshots_as_graphs(
 
         # Already sorted by time because _list_raw_particle_jsons sorts by parsed time
         n_total = len(snapshots)
-        n_sample = max(1, int(sample_ratio * n_total))
-        stride = max(1, n_total // n_sample)
-        sampled_snapshots = snapshots[::stride]
+        sampled_snapshots = _sample_sorted_sequence(snapshots, sample_ratio)
 
         for snap in tqdm(
                 sampled_snapshots,
@@ -426,7 +452,7 @@ def load_lagrangian_snapshots_as_graphs(
                 pos_raw,
                 r=radius,
                 loop=False,
-                max_num_neighbors=32,
+                max_num_neighbors=16,
             )
 
             if verbose_timing:
@@ -445,7 +471,7 @@ def load_lagrangian_snapshots_as_graphs(
                 edge_index=edge_index,
             )
             data.y = x_feat.clone()
-            data.time = torch.tensor([tval], dtype=torch.float32)
+            data.time = torch.tensor([tval], dtype=torch.float64)
             data.params = torch.tensor(params_aug.reshape(1, -1), dtype=torch.float32)
             data.cloud_id = cloud_id
             data.snapshot_name = json_path.name
@@ -534,6 +560,7 @@ def extract_scaffold_graphs(
 
 __all__ = [
     "load_lagrangian_snapshots_as_graphs",
+    "load_lagrangian_snapshot_times",
     "compute_feature_stats",
     "extract_scaffold_graphs",
 ]

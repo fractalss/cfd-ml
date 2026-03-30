@@ -317,14 +317,15 @@ def ensure_graph_artifacts(cfg, field_var: str, rebuild: bool = False, *, neighb
             df = df.copy(deep=True)
             df.loc[:, "Cell ID"] = df["Cell ID"].to_numpy(dtype=np.int64)
 
-            snap = df[["Cell ID", field_var]].copy()
+
+            snap = df.loc[:, ["Cell ID", field_var]].copy()
             snap = snap.merge(cellmap, on="Cell ID", how="left")
 
             if snap["node_id"].isna().any():
                 miss = int(snap["node_id"].isna().sum())
                 raise ValueError(f"[ERROR] {miss} rows in snapshot have Cell ID not found in reference mapping.")
 
-            snap["node_id"] = snap["node_id"].astype(np.int64)
+            snap.loc[:, "node_id"] = snap["node_id"].to_numpy(dtype=np.int64)
             snap = node_id_order.merge(snap[["node_id", field_var]], on="node_id", how="left").sort_values("node_id")
 
             if snap[field_var].isna().any():

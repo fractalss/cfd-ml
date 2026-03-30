@@ -5,17 +5,19 @@ from __future__ import annotations
 import os
 import numpy as np
 import torch
+import gc
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
     load_lagrangian_snapshots_as_graphs,
+    load_lagrangian_snapshot_times,
     compute_feature_stats,
     extract_scaffold_graphs,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import PointNetAutoencoder
+from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import PointNetGNNAutoencoder
 from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import GraphSnapshotDataset
-from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_torch
+from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
 from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
     LatentRegressorMLP,
     build_latent_regression_dataloaders,
@@ -51,6 +53,43 @@ def _normalize_graphs_in_place(graphs, feature_stats):
             g.y[:, :3] = (g.y[:, :3] - pos_mean) / (pos_std + eps)
             g.y[:, 3:4] = (g.y[:, 3:4] - fmin) / (fmax - fmin + eps)
 
+def _extract_graph_times(graphs):
+    return np.array([float(g.time.item()) for g in graphs], dtype=np.float64)
+
+
+def _match_graphs_to_reference_times(scaffold_graphs, ref_times, atol=1e-2):
+    """
+    Match scaffold graphs to a reference time sequence using nearest-time matching.
+
+    Returns
+    -------
+    matched_graphs : list
+        Scaffold graphs reordered/subselected to follow ref_times.
+    matched_times : list[float]
+        The reference times, preserved for output naming/writing.
+    """
+    if len(scaffold_graphs) == 0:
+        raise ValueError("[Lagrangian/Raw] No scaffold graphs available for time matching.")
+
+    scaffold_times = _extract_graph_times(scaffold_graphs)
+
+    matched_graphs = []
+    matched_times = []
+
+    for t_ref in ref_times:
+        idx = int(np.argmin(np.abs(scaffold_times - t_ref)))
+        dt = abs(scaffold_times[idx] - t_ref)
+
+        if dt > atol:
+            raise ValueError(
+                f"[Lagrangian/Raw] No scaffold graph within atol for ref time {t_ref:.6f}. "
+                f"Nearest scaffold time={scaffold_times[idx]:.6f}, dt={dt:.6f}, atol={atol:.6f}"
+            )
+
+        matched_graphs.append(scaffold_graphs[idx])
+        matched_times.append(float(t_ref))
+
+    return matched_graphs, matched_times
 
 def run_lagrangian_ml_pipeline(config, log_time):
     """
@@ -61,7 +100,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
       - Model learns normalized [x,y,z,field]
       - Cloud ID is passed through from scaffold graphs
       - Inference output rows are [x, y, z, Cloud ID, field]
-      - Snapshot times come from JSON "simulation time"
+      - Snapshot times follow reference timeline after matching
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
@@ -69,16 +108,19 @@ def run_lagrangian_ml_pipeline(config, log_time):
     setup_output_dir(config)
     setup_model_paths(config)
 
-    model_path = os.path.join(config.model_dir, "pointnet_lagrangian.pt")
+    model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
 
     # ---------------- Config ----------------
-    batch_size = getattr(config, "batch_size", 32)
-    latent_dim = getattr(config, "latent_dim", 64)
-    epochs = getattr(config, "epochs", 10)
+    batch_size = getattr(config, "batch_size", 2)
+    latent_dim = getattr(config, "latent_dim", 32)
+    hidden_dim = getattr(config, "hidden_dim", 64)
+    num_gnn_layers = getattr(config, "num_gnn_layers", 2)
+
+    epochs = getattr(config, "epochs", 20)
     learning_rate = getattr(config, "learning_rate", 1e-3)
-    sample_ratio = float(getattr(config, "sample_ratio", 1.0))
-    graph_radius = float(getattr(config, "graph_radius", 0.01))
+    sample_ratio = float(getattr(config, "sample_ratio", 0.05))
+    graph_radius = float(getattr(config, "graph_radius", 0.001))
 
     # AE training knobs
     grad_clip_norm = float(getattr(config, "grad_clip_norm", 1.0))
@@ -143,11 +185,13 @@ def run_lagrangian_ml_pipeline(config, log_time):
     sample = dataset[0]
     param_dim = int(sample.params.shape[1])
 
-    model = PointNetAutoencoder(
+    model = PointNetGNNAutoencoder(
         in_dim=4,
         param_dim=param_dim,
         latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
         out_dim=4,
+        num_gnn_layers=num_gnn_layers,
     ).to(device)
 
     # ==========================================================
@@ -158,8 +202,8 @@ def run_lagrangian_ml_pipeline(config, log_time):
             print(f"[INFO] Loading pretrained AE model from {model_path}")
             model.load_state_dict(torch.load(model_path, map_location=device))
     else:
-        with log_time("Training PointNet autoencoder"):
-            model = train_pointnet_torch(
+        with log_time("Training PointNet-GNN autoencoder"):
+            model = train_pointnet_gnn_torch(
                 model=model,
                 dataset=train_set,
                 device=device,
@@ -192,7 +236,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
         with torch.no_grad():
             for batch in loader_lat:
                 batch = batch.to(device)
-                _recon, z = model(batch.x, batch.batch, batch.params)
+                _recon, z = model(batch.x, batch.edge_index, batch.batch, batch.params)
                 latents.append(z.detach().cpu())
                 params_all.append(batch.params.detach().cpu())
 
@@ -238,22 +282,65 @@ def run_lagrangian_ml_pipeline(config, log_time):
         print(f"[INFO] Saved latent regressor to {latent_reg_path}")
 
     latent_reg_model.eval()
-
+    del dataset
+    del train_set
+    del latents
+    del latents_all
+    del params_all
+    gc.collect()
+    torch.cuda.empty_cache()
+    del graphs
+    gc.collect()
     # ==========================================================
-    # 7) BUILD SCAFFOLD GRAPHS (nearest Rev)
+    # 7) BUILD SCAFFOLD GRAPHS
     # ==========================================================
     with log_time("Extracting scaffold graphs"):
         scaffold_graphs = extract_scaffold_graphs(
             rev_dirs=config.rev_dirs,
             base_data_dir=config.base_data_dir,
             param_mapping=config.param_mapping,
-            param_train_array=params_all,  # kept for API compatibility
+            param_train_array=None,  # kept for API compatibility
             user_param_array=config.user_parameter,
             field_variable=config.field_variable,
             radius=graph_radius,
             sample_ratio=sample_ratio,
             feature_stats=feature_stats,
         )
+    # ==========================================================
+    # 7b) BUILD REFERENCE TIME AXIS FROM CANONICAL REV
+    # ==========================================================
+    reference_time_rev = getattr(config, "reference_time_rev", config.rev_dirs[0])
+
+    ref_times = load_lagrangian_snapshot_times(
+        rev_dir=reference_time_rev,
+        base_data_dir=config.base_data_dir,
+        sample_ratio=sample_ratio,
+    )
+
+    print(
+        f"[TimingRef] Using reference_time_rev='{reference_time_rev}' "
+        f"with {len(ref_times)} reference times"
+    )
+
+    # ==========================================================
+    # 7c) ALIGN SCAFFOLD GRAPHS TO REFERENCE TIMES (index-based)
+    # ==========================================================
+    if len(scaffold_graphs) != len(ref_times):
+        raise ValueError(
+            f"[Lagrangian/Raw] scaffold graphs ({len(scaffold_graphs)}) and "
+            f"reference times ({len(ref_times)}) have different lengths."
+        )
+
+    scaffold_graphs_aligned = list(scaffold_graphs)
+    matched_times = [float(t) for t in ref_times]
+
+    del scaffold_graphs
+    gc.collect()
+
+    print(
+        f"[TimingMatch] Index-aligned {len(scaffold_graphs_aligned)} scaffold graphs "
+        f"to {len(matched_times)} reference times"
+    )
 
     # ==========================================================
     # 8) INFERENCE
@@ -263,13 +350,17 @@ def run_lagrangian_ml_pipeline(config, log_time):
             user_param=config.user_parameter,
             model=model,
             latent_regressor=latent_reg_model,
-            scaffold_graphs=scaffold_graphs,
+            scaffold_graphs=scaffold_graphs_aligned,
             output_dir=config.output_dir,
             field_variable=config.field_variable,
             feature_stats=feature_stats,
             device=device,
             batch_size=1,
+            override_times=matched_times,
         )
+
+    del scaffold_graphs_aligned
+    gc.collect()
 
     # ==========================================================
     # 9) WRITE OUTPUT
@@ -282,5 +373,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
         times=times,
         field_variable=config.field_variable,
         out_dir=out_dir,
+        time_mode="raw",
     )
     print(f"[INFO] ROM inference complete. Output saved to: {out_dir}")
