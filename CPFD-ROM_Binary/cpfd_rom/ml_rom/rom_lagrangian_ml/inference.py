@@ -9,6 +9,98 @@ import torch
 from torch_geometric.loader import DataLoader
 
 
+def _graphs_are_time_sorted(graphs: list) -> bool:
+    if len(graphs) <= 1:
+        return True
+    times = np.array([float(g.time.item()) for g in graphs], dtype=np.float64)
+    return bool(np.all(np.diff(times) >= 0.0))
+
+
+def _validate_template_graphs(scaffold_graphs: list) -> None:
+    if len(scaffold_graphs) == 0:
+        raise ValueError("[Inference] No template graphs provided.")
+
+    required_attrs = ["x", "pos", "edge_index", "params", "time", "cloud_id"]
+    for i, g in enumerate(scaffold_graphs):
+        for attr in required_attrs:
+            if not hasattr(g, attr):
+                raise AttributeError(
+                    f"[Inference] Template graph index {i} is missing required attribute '{attr}'."
+                )
+
+    if not _graphs_are_time_sorted(scaffold_graphs):
+        raise ValueError(
+            "[Inference] Template graphs are not sorted by time. "
+            "Sort graphs by time before calling inference."
+        )
+
+
+def _print_template_summary(scaffold_graphs: list, override_times: Optional[Sequence[float]]) -> None:
+    g0 = scaffold_graphs[0]
+    g_last = scaffold_graphs[-1]
+
+    t0 = float(g0.time.item())
+    t_last = float(g_last.time.item())
+
+    snap0 = getattr(g0, "snapshot_name", "<missing>")
+    snap_last = getattr(g_last, "snapshot_name", "<missing>")
+
+    print("[Inference] Template graph summary")
+    print(f"  num_graphs              : {len(scaffold_graphs)}")
+    print(f"  first_template_time     : {t0:.6f}")
+    print(f"  first_template_snapshot : {snap0}")
+    print(f"  last_template_time      : {t_last:.6f}")
+    print(f"  last_template_snapshot  : {snap_last}")
+
+    if override_times is not None and len(override_times) > 0:
+        print(f"  first_override_time     : {float(override_times[0]):.6f}")
+        print(f"  last_override_time      : {float(override_times[-1]):.6f}")
+
+
+def _check_override_alignment(scaffold_graphs: list, override_times: Optional[Sequence[float]], atol: float) -> None:
+    if override_times is None:
+        return
+
+    if len(override_times) != len(scaffold_graphs):
+        raise ValueError(
+            f"[Inference] override_times length ({len(override_times)}) must match "
+            f"number of template graphs ({len(scaffold_graphs)})."
+        )
+
+    t_graph_0 = float(scaffold_graphs[0].time.item())
+    t_override_0 = float(override_times[0])
+
+    dt0 = abs(t_graph_0 - t_override_0)
+    if dt0 > atol:
+        raise ValueError(
+            f"[Inference] First override time does not match first template graph time within tolerance.\n"
+            f"  template time  = {t_graph_0:.6f}\n"
+            f"  override time  = {t_override_0:.6f}\n"
+            f"  abs diff       = {dt0:.6f}\n"
+            f"  allowed atol   = {atol:.6f}"
+        )
+
+
+def _denormalize_prediction(
+    pos: torch.Tensor,
+    field: torch.Tensor,
+    feature_stats: dict | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if feature_stats is None:
+        return pos, field
+
+    pos_mean = feature_stats["pos_mean"].to(device)
+    pos_std = feature_stats["pos_std"].to(device)
+    pos = pos * (pos_std + 1e-8) + pos_mean
+
+    fmin = float(feature_stats["field_min"])
+    fmax = float(feature_stats["field_max"])
+    field = field * (fmax - fmin + 1e-8) + fmin
+
+    return pos, field
+
+
 def infer_pointnet_with_latent_regression(
     user_param,
     model: torch.nn.Module,
@@ -20,38 +112,37 @@ def infer_pointnet_with_latent_regression(
     device: torch.device = torch.device("cpu"),
     batch_size: int = 1,
     override_times: Optional[Sequence[float]] = None,
+    time_alignment_atol: float = 1e-8,
+    debug: bool = True,
 ):
     """
-    Inference for raw-particle Lagrangian ROM.
+    Inference for the old raw-particle Lagrangian ROM path.
 
-    Raw-particle contract:
-      - model predicts normalized [x, y, z, field]
-      - Cloud ID is passed through from scaffold graph
-      - output rows are [x, y, z, Cloud ID, field]
+    Contract
+    --------
+    - model predicts normalized [x, y, z, field]
+    - Cloud ID is passed through from template graph
+    - output rows are [x, y, z, Cloud ID, field]
+    - template graphs are expected to be time-sorted
+    - the nearest rev's true first snapshot should be the first template graph
 
-    Time handling:
-      - if override_times is provided, those times are used for outputs
-      - otherwise scaffold graph times (batch.time) are used
-      - if neither exists, graph index is used as fallback
-
-    Returns
-    -------
-    preds_list : list[np.ndarray]
-        Each entry has shape [N_i, 5] with columns:
-            [x, y, z, Cloud ID, field]
-    times : list[float]
-        Output times, one per snapshot.
+    Time handling
+    -------------
+    - if override_times is provided, those times are used for outputs
+    - otherwise template graph times (batch.time) are used
+    - if neither exists, graph index is used as fallback
     """
     model = model.to(device).eval()
     latent_regressor = latent_regressor.to(device).eval()
 
     if override_times is not None:
         override_times = [float(t) for t in override_times]
-        if len(override_times) != len(scaffold_graphs):
-            raise ValueError(
-                f"[Inference] override_times length ({len(override_times)}) must match "
-                f"number of scaffold_graphs ({len(scaffold_graphs)})."
-            )
+
+    _validate_template_graphs(scaffold_graphs)
+    _check_override_alignment(scaffold_graphs, override_times, atol=time_alignment_atol)
+
+    if debug:
+        _print_template_summary(scaffold_graphs, override_times)
 
     loader = DataLoader(
         scaffold_graphs,
@@ -60,16 +151,16 @@ def infer_pointnet_with_latent_regression(
         drop_last=False,
     )
 
-    preds_list = []
-    times = []
+    preds_list: list[np.ndarray] = []
+    times: list[float] = []
 
-    user_param_vec = np.asarray(user_param, dtype=np.float32).reshape(-1)  # [P_phys]
+    user_param_vec = np.asarray(user_param, dtype=np.float32).reshape(-1)
     p_phys_dim = user_param_vec.shape[0]
 
-    graph_counter = 0  # global graph index across batches
+    graph_counter = 0
 
     with torch.no_grad():
-        for batch in loader:
+        for batch_id, batch in enumerate(loader):
             batch = batch.to(device)
 
             if not hasattr(batch, "params"):
@@ -86,7 +177,7 @@ def infer_pointnet_with_latent_regression(
                     f"[Inference] Expected batch.params to be 2D [B, P_aug], got {tuple(batch.params.shape)}"
                 )
 
-            # batch.params is [B, P_aug], with last column = t_norm
+            # batch.params is [B, P_aug], with last column assumed to be t_norm
             t_norm = batch.params[:, -1:]   # [B, 1]
             B = t_norm.shape[0]
 
@@ -98,10 +189,10 @@ def infer_pointnet_with_latent_regression(
 
             p_aug = torch.cat([user_phys, t_norm], dim=1)  # [B, P_phys + 1]
 
-            # Predict latent code from parameter + normalized time
+            # Predict latent code from physical parameter + normalized time
             z_pred = latent_regressor(p_aug)  # [B, latent_dim]
 
-            # Decode using scaffold/template features
+            # Decode using template particle features
             recon = model.decode(
                 z_pred,
                 batch.x[:, :4],
@@ -110,9 +201,14 @@ def infer_pointnet_with_latent_regression(
                 p_aug,
             )  # [N_total, 4]
 
+            if recon.dim() != 2 or recon.shape[1] < 4:
+                raise ValueError(
+                    f"[Inference] Expected recon to have shape [N, >=4], got {tuple(recon.shape)}"
+                )
+
             batch_vec = batch.batch  # [N_total]
 
-            # Fallback graph-level times from scaffold graphs
+            # Graph-level times from template graphs
             if hasattr(batch, "time"):
                 t_batch = batch.time.view(-1)
                 if t_batch.numel() != B:
@@ -123,6 +219,9 @@ def infer_pointnet_with_latent_regression(
             else:
                 t_batch = None
 
+            # Optional graph-level names if preserved by batch collation
+            has_snapshot_name = hasattr(batch, "snapshot_name")
+
             for g_idx in range(B):
                 mask = (batch_vec == g_idx)
                 recon_g = recon[mask]  # [N_i, 4]
@@ -130,27 +229,18 @@ def infer_pointnet_with_latent_regression(
                 pos = recon_g[:, :3]
                 field = recon_g[:, 3:4]
 
-                # Denormalize back to physical units
-                if feature_stats is not None:
-                    pos_mean = feature_stats["pos_mean"].to(device)
-                    pos_std = feature_stats["pos_std"].to(device)
-                    pos = pos * (pos_std + 1e-8) + pos_mean
+                pos, field = _denormalize_prediction(
+                    pos=pos,
+                    field=field,
+                    feature_stats=feature_stats,
+                    device=device,
+                )
 
-                    fmin = float(feature_stats["field_min"])
-                    fmax = float(feature_stats["field_max"])
-                    field = field * (fmax - fmin + 1e-8) + fmin
+                cid = batch.cloud_id[mask].to(device).float().view(-1, 1)
 
-                # Pass through Cloud ID from scaffold graph
-                cid = batch.cloud_id[mask].to(device).float().view(-1, 1)  # [N_i, 1]
-
-                # Final raw-particle output: [x, y, z, Cloud ID, field]
                 out_g = torch.cat([pos, cid, field], dim=1)  # [N_i, 5]
                 preds_list.append(out_g.cpu().numpy())
 
-                # Output time selection priority:
-                # 1. override_times
-                # 2. scaffold graph batch.time
-                # 3. global graph index
                 if override_times is not None:
                     tval = float(override_times[graph_counter])
                 elif t_batch is not None:
@@ -159,6 +249,31 @@ def infer_pointnet_with_latent_regression(
                     tval = float(graph_counter)
 
                 times.append(tval)
+
+                if debug and graph_counter < 3:
+                    try:
+                        snap_name = (
+                            batch.snapshot_name[g_idx]
+                            if has_snapshot_name and isinstance(batch.snapshot_name, (list, tuple))
+                            else getattr(scaffold_graphs[graph_counter], "snapshot_name", "<missing>")
+                        )
+                    except Exception:
+                        snap_name = getattr(scaffold_graphs[graph_counter], "snapshot_name", "<missing>")
+
+                    template_time = (
+                        float(t_batch[g_idx].item()) if t_batch is not None
+                        else getattr(scaffold_graphs[graph_counter], "time", torch.tensor([np.nan])).item()
+                    )
+
+                    print(f"[Inference][Graph {graph_counter}]")
+                    print(f"  template_snapshot      : {snap_name}")
+                    print(f"  template_time          : {template_time:.6f}")
+                    print(f"  output_time            : {tval:.6f}")
+                    print(f"  template_nodes         : {int(mask.sum().item())}")
+                    print(f"  predicted_xyz_min      : {pos.min(dim=0).values.detach().cpu().numpy()}")
+                    print(f"  predicted_xyz_max      : {pos.max(dim=0).values.detach().cpu().numpy()}")
+                    print(f"  predicted_field_minmax : ({field.min().item():.6e}, {field.max().item():.6e})")
+
                 graph_counter += 1
 
     return preds_list, times

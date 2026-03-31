@@ -2,39 +2,44 @@
 
 from __future__ import annotations
 
+import gc
 import os
+
 import numpy as np
 import torch
-import gc
-from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
+from torch_geometric.loader import DataLoader
 
 from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
-    load_lagrangian_snapshots_as_graphs,
-    load_lagrangian_snapshot_times,
     compute_feature_stats,
     extract_scaffold_graphs,
+    get_initial_template_graph,
+    load_lagrangian_snapshot_times,
+    load_lagrangian_snapshots_as_graphs,
+    sort_graphs_by_time,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import PointNetGNNAutoencoder
 from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import GraphSnapshotDataset
-from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
+from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
+from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import (
+    infer_pointnet_with_latent_regression,
+)
 from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
     LatentRegressorMLP,
     build_latent_regression_dataloaders,
     train_latent_regressor_torch,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import (
-    infer_pointnet_with_latent_regression,
+from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import (
+    PointNetGNNAutoencoder,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
-
-from cpfd_rom.util.output_utils import setup_output_dir
+from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
 from cpfd_rom.util.model_utils import setup_model_paths
+from cpfd_rom.util.output_utils import setup_output_dir
 
 
 def _normalize_graphs_in_place(graphs, feature_stats):
     """
     Normalize x/y in-place using feature_stats, while keeping .pos physical.
+
     Assumes:
       - g.x, g.y are [N,4] = [x,y,z,field]
       - g.pos is physical xyz
@@ -53,54 +58,49 @@ def _normalize_graphs_in_place(graphs, feature_stats):
             g.y[:, :3] = (g.y[:, :3] - pos_mean) / (pos_std + eps)
             g.y[:, 3:4] = (g.y[:, 3:4] - fmin) / (fmax - fmin + eps)
 
+
 def _extract_graph_times(graphs):
     return np.array([float(g.time.item()) for g in graphs], dtype=np.float64)
 
 
-def _match_graphs_to_reference_times(scaffold_graphs, ref_times, atol=1e-2):
-    """
-    Match scaffold graphs to a reference time sequence using nearest-time matching.
+def _as_1d_user_param_array(user_parameter) -> np.ndarray:
+    if np.isscalar(user_parameter):
+        return np.array([float(user_parameter)], dtype=np.float32)
+    return np.asarray(user_parameter, dtype=np.float32).reshape(-1)
 
-    Returns
-    -------
-    matched_graphs : list
-        Scaffold graphs reordered/subselected to follow ref_times.
-    matched_times : list[float]
-        The reference times, preserved for output naming/writing.
-    """
-    if len(scaffold_graphs) == 0:
-        raise ValueError("[Lagrangian/Raw] No scaffold graphs available for time matching.")
 
-    scaffold_times = _extract_graph_times(scaffold_graphs)
+def _validate_reference_times(ref_times: np.ndarray) -> np.ndarray:
+    ref_times = np.asarray(ref_times, dtype=np.float64).reshape(-1)
+    if ref_times.size == 0:
+        raise ValueError("[Lagrangian/Raw] Reference time axis is empty.")
+    if ref_times.size >= 2 and not np.all(np.diff(ref_times) >= 0.0):
+        raise ValueError("[Lagrangian/Raw] Reference times are not sorted.")
+    return ref_times
 
-    matched_graphs = []
-    matched_times = []
 
-    for t_ref in ref_times:
-        idx = int(np.argmin(np.abs(scaffold_times - t_ref)))
-        dt = abs(scaffold_times[idx] - t_ref)
+def _print_template_alignment_summary(scaffold_graphs, matched_times):
+    g0 = get_initial_template_graph(scaffold_graphs)
+    print("[TimingMatch] Template alignment summary")
+    print(f"  num_template_graphs     : {len(scaffold_graphs)}")
+    print(f"  first_template_time     : {float(g0.time.item()):.6f}")
+    print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
+    print(f"  first_output_time       : {float(matched_times[0]):.6f}")
+    print(f"  last_output_time        : {float(matched_times[-1]):.6f}")
 
-        if dt > atol:
-            raise ValueError(
-                f"[Lagrangian/Raw] No scaffold graph within atol for ref time {t_ref:.6f}. "
-                f"Nearest scaffold time={scaffold_times[idx]:.6f}, dt={dt:.6f}, atol={atol:.6f}"
-            )
-
-        matched_graphs.append(scaffold_graphs[idx])
-        matched_times.append(float(t_ref))
-
-    return matched_graphs, matched_times
 
 def run_lagrangian_ml_pipeline(config, log_time):
     """
-    Raw-particle Lagrangian ROM pipeline.
+    Raw-particle Lagrangian ROM pipeline (old particle path, Step-2 cleaned).
 
-    Contract:
-      - Input graphs come from Raw.particle.*.json + .npy
-      - Model learns normalized [x,y,z,field]
-      - Cloud ID is passed through from scaffold graphs
-      - Inference output rows are [x, y, z, Cloud ID, field]
-      - Snapshot times follow reference timeline after matching
+    Contract
+    --------
+    - Input graphs come from Raw.particle.*.json + .npy
+    - Model learns normalized [x, y, z, field]
+    - Cloud ID is passed through from template graphs
+    - Inference output rows are [x, y, z, Cloud ID, field]
+    - Template graphs come from the nearest training rev
+    - Template graphs are explicitly sorted by time
+    - The nearest rev's true first snapshot is treated as the initialization template
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
@@ -111,27 +111,37 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
 
-    # ---------------- Config ----------------
-    batch_size = getattr(config, "batch_size", 2)
-    latent_dim = getattr(config, "latent_dim", 32)
-    hidden_dim = getattr(config, "hidden_dim", 64)
-    num_gnn_layers = getattr(config, "num_gnn_layers", 2)
+    # ----------------------------------------------------------
+    # Config
+    # ----------------------------------------------------------
+    batch_size = int(getattr(config, "batch_size", 2))
+    latent_dim = int(getattr(config, "latent_dim", 32))
+    hidden_dim = int(getattr(config, "hidden_dim", 64))
+    num_gnn_layers = int(getattr(config, "num_gnn_layers", 2))
 
-    epochs = getattr(config, "epochs", 20)
-    learning_rate = getattr(config, "learning_rate", 1e-3)
+    epochs = int(getattr(config, "epochs", 10))
+    learning_rate = float(getattr(config, "learning_rate", 1e-3))
     sample_ratio = float(getattr(config, "sample_ratio", 0.05))
     graph_radius = float(getattr(config, "graph_radius", 0.001))
 
     # AE training knobs
     grad_clip_norm = float(getattr(config, "grad_clip_norm", 1.0))
     field_loss_weight = float(getattr(config, "field_loss_weight", 1.0))
+    com_loss_weight = float(getattr(config, "com_loss_weight", 0.0))
+    spread_loss_weight = float(getattr(config, "spread_loss_weight", 0.0))
 
     # Latent regressor knobs
-    latent_reg_epochs = getattr(config, "latent_reg_epochs", 50)
-    latent_reg_lr = getattr(config, "latent_reg_lr", 1e-3)
-    latent_reg_weight_decay = getattr(config, "latent_reg_weight_decay", 1e-4)
-    latent_reg_patience = getattr(config, "latent_reg_patience", 5)
+    latent_reg_epochs = int(getattr(config, "latent_reg_epochs", 50))
+    latent_reg_lr = float(getattr(config, "latent_reg_lr", 1e-3))
+    latent_reg_weight_decay = float(getattr(config, "latent_reg_weight_decay", 1e-4))
+    latent_reg_patience = int(getattr(config, "latent_reg_patience", 5))
     latent_reg_hidden_dims = getattr(config, "latent_reg_hidden_dims", [128, 64])
+
+    # Inference/debug knobs
+    inference_debug = bool(getattr(config, "inference_debug", True))
+    inference_time_alignment_atol = float(
+        getattr(config, "inference_time_alignment_atol", 1e-8)
+    )
 
     if not getattr(config, "rev_dirs", None):
         raise ValueError("[Lagrangian/Raw] config.rev_dirs must be provided.")
@@ -143,6 +153,9 @@ def run_lagrangian_ml_pipeline(config, log_time):
         raise ValueError("[Lagrangian/Raw] config.field_variable must be provided.")
     if not hasattr(config, "user_parameter"):
         raise ValueError("[Lagrangian/Raw] config.user_parameter must be set.")
+
+    user_param_arr = _as_1d_user_param_array(config.user_parameter)
+    print(f"[INFO] user_parameter = {user_param_arr}")
 
     # ==========================================================
     # 1) LOAD TRAINING GRAPHS ONCE (RAW), COMPUTE STATS, NORMALIZE
@@ -156,6 +169,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
             radius=graph_radius,
             sample_ratio=sample_ratio,
             feature_stats=None,
+            verbose_timing=False,
         )
 
         if len(graphs) == 0:
@@ -168,7 +182,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     dataset = GraphSnapshotDataset(graphs)
 
     # ==========================================================
-    # 2) TRAIN/VAL SPLIT
+    # 2) TRAIN / VAL SPLIT
     # ==========================================================
     indices = np.arange(len(dataset))
     train_idx, _val_idx = train_test_split(
@@ -212,6 +226,8 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 batch_size=batch_size,
                 grad_clip_norm=grad_clip_norm,
                 field_loss_weight=field_loss_weight,
+                com_loss_weight=com_loss_weight,
+                spread_loss_weight=spread_loss_weight,
             )
 
         torch.save(model.state_dict(), model_path)
@@ -240,8 +256,11 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 latents.append(z.detach().cpu())
                 params_all.append(batch.params.detach().cpu())
 
-    latents_all = torch.cat(latents, dim=0).numpy()    # [S, Z]
-    params_all = torch.cat(params_all, dim=0).numpy()  # [S, P_aug]
+    latents_all = torch.cat(latents, dim=0).numpy()
+    params_all = torch.cat(params_all, dim=0).numpy()
+
+    print(f"[INFO] Latent matrix shape     : {latents_all.shape}")
+    print(f"[INFO] Params matrix shape     : {params_all.shape}")
 
     # ==========================================================
     # 6) TRAIN LATENT REGRESSOR
@@ -282,20 +301,28 @@ def run_lagrangian_ml_pipeline(config, log_time):
         print(f"[INFO] Saved latent regressor to {latent_reg_path}")
 
     latent_reg_model.eval()
+
+    # ----------------------------------------------------------
+    # Cleanup training data memory
+    # ----------------------------------------------------------
     del dataset
     del train_set
     del latents
     del latents_all
     del params_all
     gc.collect()
-    torch.cuda.empty_cache()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     del graphs
     gc.collect()
+
     # ==========================================================
-    # 7) BUILD SCAFFOLD GRAPHS
+    # 7) EXTRACT TEMPLATE PARTICLE GRAPHS FROM NEAREST REV
     # ==========================================================
-    with log_time("Extracting scaffold graphs"):
-        scaffold_graphs = extract_scaffold_graphs(
+    with log_time("Extracting nearest-rev template graphs"):
+        template_graphs = extract_scaffold_graphs(
             rev_dirs=config.rev_dirs,
             base_data_dir=config.base_data_dir,
             param_mapping=config.param_mapping,
@@ -305,9 +332,20 @@ def run_lagrangian_ml_pipeline(config, log_time):
             radius=graph_radius,
             sample_ratio=sample_ratio,
             feature_stats=feature_stats,
+            verbose_timing=False,
         )
+
+    # Explicit time sort and initialization confirmation
+    template_graphs = sort_graphs_by_time(template_graphs)
+    g0 = get_initial_template_graph(template_graphs)
+
+    print("[TemplateInit] Nearest-rev template initialization confirmed")
+    print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
+    print(f"  first_template_time     : {float(g0.time.item()):.6f}")
+    print(f"  num_template_graphs     : {len(template_graphs)}")
+
     # ==========================================================
-    # 7b) BUILD REFERENCE TIME AXIS FROM CANONICAL REV
+    # 7b) BUILD REFERENCE TIME AXIS
     # ==========================================================
     reference_time_rev = getattr(config, "reference_time_rev", config.rev_dirs[0])
 
@@ -316,29 +354,34 @@ def run_lagrangian_ml_pipeline(config, log_time):
         base_data_dir=config.base_data_dir,
         sample_ratio=sample_ratio,
     )
+    ref_times = _validate_reference_times(ref_times)
 
     print(
         f"[TimingRef] Using reference_time_rev='{reference_time_rev}' "
-        f"with {len(ref_times)} reference times"
+        f"with {len(ref_times)} sorted reference times"
     )
 
     # ==========================================================
-    # 7c) ALIGN SCAFFOLD GRAPHS TO REFERENCE TIMES (index-based)
+    # 7c) ALIGN TEMPLATE GRAPHS TO REFERENCE TIMES
     # ==========================================================
-    if len(scaffold_graphs) != len(ref_times):
+    if len(template_graphs) != len(ref_times):
         raise ValueError(
-            f"[Lagrangian/Raw] scaffold graphs ({len(scaffold_graphs)}) and "
+            f"[Lagrangian/Raw] template graphs ({len(template_graphs)}) and "
             f"reference times ({len(ref_times)}) have different lengths."
         )
 
-    scaffold_graphs_aligned = list(scaffold_graphs)
+    # For the old particle code path, keep strict index-based alignment,
+    # but now after explicit sorting on both sides.
+    matched_graphs = list(template_graphs)
     matched_times = [float(t) for t in ref_times]
 
-    del scaffold_graphs
+    _print_template_alignment_summary(matched_graphs, matched_times)
+
+    del template_graphs
     gc.collect()
 
     print(
-        f"[TimingMatch] Index-aligned {len(scaffold_graphs_aligned)} scaffold graphs "
+        f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
         f"to {len(matched_times)} reference times"
     )
 
@@ -350,16 +393,18 @@ def run_lagrangian_ml_pipeline(config, log_time):
             user_param=config.user_parameter,
             model=model,
             latent_regressor=latent_reg_model,
-            scaffold_graphs=scaffold_graphs_aligned,
+            scaffold_graphs=matched_graphs,
             output_dir=config.output_dir,
             field_variable=config.field_variable,
             feature_stats=feature_stats,
             device=device,
             batch_size=1,
             override_times=matched_times,
+            time_alignment_atol=inference_time_alignment_atol,
+            debug=inference_debug,
         )
 
-    del scaffold_graphs_aligned
+    del matched_graphs
     gc.collect()
 
     # ==========================================================
@@ -375,4 +420,5 @@ def run_lagrangian_ml_pipeline(config, log_time):
         out_dir=out_dir,
         time_mode="raw",
     )
+
     print(f"[INFO] ROM inference complete. Output saved to: {out_dir}")
