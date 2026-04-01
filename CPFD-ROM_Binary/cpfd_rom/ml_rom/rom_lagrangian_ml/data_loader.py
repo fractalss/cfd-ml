@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -15,10 +15,6 @@ from tqdm import tqdm
 
 from cpfd_rom.util.file_parsing import get_columns_from_json_cached
 
-
-# ---------------------------------------------------------------------
-# Required JSON column names for raw-particle Lagrangian ROM
-# ---------------------------------------------------------------------
 
 RAW_REQUIRED_BASE = [
     "Cloud ID",
@@ -32,14 +28,9 @@ RAW_PARTICLE_TIME_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
 def _sample_sorted_sequence(seq, sample_ratio: float):
     if sample_ratio >= 1.0:
         return list(seq)
-
     n_total = len(seq)
     n_keep = max(1, int(round(n_total * sample_ratio)))
     idx = np.linspace(0, n_total - 1, n_keep, dtype=int)
@@ -47,12 +38,6 @@ def _sample_sorted_sequence(seq, sample_ratio: float):
 
 
 def _time_from_raw_particle_filename(path: Path) -> float:
-    """
-    Parse simulation time directly from filename.
-
-    Example:
-      Raw.particle.00595_5.9502e+01.json -> 59.502
-    """
     m = RAW_PARTICLE_TIME_RE.match(path.name)
     if not m:
         raise ValueError(
@@ -62,10 +47,6 @@ def _time_from_raw_particle_filename(path: Path) -> float:
 
 
 def _list_raw_particle_jsons(dir_path: Path) -> list[Path]:
-    """
-    Return sorted list of Raw.particle.*.json files in a Rev directory.
-    Sorting is by parsed simulation time.
-    """
     files = [f for f in dir_path.glob("Raw.particle.*.json") if f.is_file()]
     files = sorted(files, key=_time_from_raw_particle_filename)
 
@@ -78,12 +59,6 @@ def _list_raw_particle_jsons(dir_path: Path) -> list[Path]:
 
 
 def _matching_npy_from_json(json_path: Path) -> Path:
-    """
-    For:
-        Raw.particle.00200_2.0000e+01.json
-    return:
-        Raw.particle.00200_2.0000e+01.npy
-    """
     npy_path = json_path.with_suffix(".npy")
     if not npy_path.exists():
         raise FileNotFoundError(
@@ -93,16 +68,10 @@ def _matching_npy_from_json(json_path: Path) -> Path:
 
 
 def _get_json_columns(json_path: Path) -> list[str]:
-    """
-    Read column names from JSON in listed order.
-    """
     return list(get_columns_from_json_cached(str(json_path)))
 
 
 def _build_column_index_from_columns(columns: list[str], field_variable: str) -> dict[str, int]:
-    """
-    Build required column index map from a pre-read JSON column list.
-    """
     required = RAW_REQUIRED_BASE + [field_variable]
     missing = [c for c in required if c not in columns]
     if missing:
@@ -114,38 +83,26 @@ def _build_column_index_from_columns(columns: list[str], field_variable: str) ->
 
 
 def _param_to_1d_array(param_val) -> np.ndarray:
-    """
-    Support scalar or vector param mapping.
-    """
     return np.asarray(param_val, dtype=np.float32).reshape(-1)
 
 
 def _as_contiguous(a: np.ndarray) -> np.ndarray:
-    """
-    Ensure array is contiguous before torch.from_numpy.
-    """
-    if a.flags["C_CONTIGUOUS"]:
-        return a
-    return np.ascontiguousarray(a)
+    return a if a.flags["C_CONTIGUOUS"] else np.ascontiguousarray(a)
 
 
 def _normalize_features(
     pos_raw: torch.Tensor,
     field_raw: torch.Tensor,
-    feature_stats: dict | None,
+    feature_stats: Optional[dict],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Normalize [x,y,z] with mean/std and field with min/max.
-    If feature_stats is None, return raw tensors.
-    """
     if feature_stats is None:
         return pos_raw, field_raw
 
     eps = 1e-8
-    pos_mean = feature_stats["pos_mean"]
-    pos_std = feature_stats["pos_std"]
-    fmin = float(feature_stats["field_min"])
-    fmax = float(feature_stats["field_max"])
+    pos_mean = feature_stats["pos_mean"].to(pos_raw.device, dtype=pos_raw.dtype)
+    pos_std = feature_stats["pos_std"].to(pos_raw.device, dtype=pos_raw.dtype)
+    fmin = torch.tensor(float(feature_stats["field_min"]), device=field_raw.device, dtype=field_raw.dtype)
+    fmax = torch.tensor(float(feature_stats["field_max"]), device=field_raw.device, dtype=field_raw.dtype)
 
     pos_feat = (pos_raw - pos_mean) / (pos_std + eps)
     field_feat = (field_raw - fmin) / (fmax - fmin + eps)
@@ -158,21 +115,6 @@ def _extract_required_columns(
     idx: dict[str, int],
     field_variable: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Extract only required columns:
-      - xyz
-      - field
-      - cloud id
-
-    Supports:
-      1) dense ndarray of shape [N, C]
-      2) structured ndarray of shape [N] with named fields
-
-    Returns:
-      pos_np   : [N, 3] float32
-      field_np : [N, 1] float32
-      cloud_np : [N]    integer-like
-    """
     if arr.ndim == 2:
         required_col_count = max(idx.values()) + 1
         if arr.shape[1] < required_col_count:
@@ -255,9 +197,6 @@ def _build_rev_snapshot_meta(
     rev_path: Path,
     field_variable: str,
 ) -> dict:
-    """
-    Build snapshot metadata for one rev directory.
-    """
     if not rev_path.exists():
         raise FileNotFoundError(f"[Lagrangian/Raw] Rev directory not found: {rev_path}")
 
@@ -273,18 +212,17 @@ def _build_rev_snapshot_meta(
 
     snapshot_meta = []
     for json_path in json_files:
-        tval = _time_from_raw_particle_filename(json_path)
         snapshot_meta.append(
             {
                 "json_path": json_path,
                 "npy_path": _matching_npy_from_json(json_path),
-                "time": tval,
+                "time": _time_from_raw_particle_filename(json_path),
             }
         )
 
     snapshot_meta = sorted(snapshot_meta, key=lambda s: float(s["time"]))
-
     times = np.array([float(s["time"]) for s in snapshot_meta], dtype=np.float64)
+
     if len(times) >= 2 and not np.all(np.diff(times) >= 0):
         raise ValueError(f"[Lagrangian/Raw] Snapshot metadata not time-sorted for {rev_path}")
 
@@ -303,49 +241,43 @@ def _build_data_object(
     field_raw: torch.Tensor,
     cloud_id: torch.Tensor,
     edge_index: torch.Tensor,
-    params_aug: np.ndarray,
+    params: np.ndarray,
     tval: float,
     snapshot_name: str,
     rev_name: str,
-    feature_stats: dict | None,
+    feature_stats: Optional[dict],
 ) -> Data:
-    """
-    Build a PyG Data object for one raw-particle snapshot.
-    """
     pos_feat, field_feat = _normalize_features(pos_raw, field_raw, feature_stats)
-    x_feat = torch.cat([pos_feat, field_feat], dim=1)  # [N,4]
+    x_feat = torch.cat([pos_feat, field_feat], dim=1)
 
     data = Data(
         x=x_feat,
+        y=x_feat.clone(),
         pos=pos_raw,
         edge_index=edge_index,
     )
-    data.y = x_feat.clone()
-    data.time = torch.tensor([tval], dtype=torch.float64)
-    data.params = torch.tensor(params_aug.reshape(1, -1), dtype=torch.float32)
+    data.time = torch.tensor([tval], dtype=torch.float32)
+    data.params = torch.tensor(params.reshape(1, -1), dtype=torch.float32)
     data.cloud_id = cloud_id
     data.snapshot_name = snapshot_name
     data.rev_dir = rev_name
     return data
 
 
-# ---------------------------------------------------------------------
-# Feature statistics
-# ---------------------------------------------------------------------
-
 def compute_feature_stats(graphs: list[Data]) -> dict[str, torch.Tensor | float]:
-    """
-    Compute normalization stats from UNNORMALIZED graphs.
-
-    Assumptions:
-      - g.pos is always physical xyz
-      - g.x[:, 3:4] is physical field if stats are computed before normalization
-    """
     if not graphs:
         raise ValueError("[Lagrangian/Raw] Cannot compute feature stats on empty graph list.")
 
     all_pos = torch.cat([g.pos for g in graphs], dim=0)
-    all_field = torch.cat([g.x[:, 3:4] for g in graphs], dim=0)
+
+    field_tensors = []
+    for g in graphs:
+        if hasattr(g, "field_raw"):
+            field_tensors.append(g.field_raw)
+        else:
+            field_tensors.append(g.x[:, 3:4])
+
+    all_field = torch.cat(field_tensors, dim=0)
 
     pos_std = all_pos.std(dim=0)
     pos_std = torch.where(pos_std > 0, pos_std, torch.ones_like(pos_std))
@@ -358,20 +290,14 @@ def compute_feature_stats(graphs: list[Data]) -> dict[str, torch.Tensor | float]
     }
 
 
-# ---------------------------------------------------------------------
-# Snapshot-time helpers
-# ---------------------------------------------------------------------
-
 def load_lagrangian_snapshot_times(
     rev_dir: str,
     base_data_dir: str,
     sample_ratio: float = 1.0,
+    field_variable: str = "Particle volume fraction",
 ) -> np.ndarray:
-    """
-    Return sampled raw snapshot times for one rev, always sorted.
-    """
     rev_path = Path(base_data_dir) / rev_dir
-    meta = _build_rev_snapshot_meta(rev_path, field_variable="Particle volume fraction")
+    meta = _build_rev_snapshot_meta(rev_path, field_variable=field_variable)
     snapshots = _sample_sorted_sequence(meta["snapshots"], sample_ratio)
     times = np.array([float(s["time"]) for s in snapshots], dtype=np.float64)
 
@@ -383,10 +309,6 @@ def load_lagrangian_snapshot_times(
     return times
 
 
-# ---------------------------------------------------------------------
-# Main raw-particle loader
-# ---------------------------------------------------------------------
-
 def load_lagrangian_snapshots_as_graphs(
     rev_dirs,
     base_data_dir,
@@ -395,24 +317,9 @@ def load_lagrangian_snapshots_as_graphs(
     radius=0.001,
     sample_ratio=1.0,
     feature_stats=None,
+    max_num_neighbors: int = 16,
     verbose_timing: bool = False,
 ):
-    """
-    Load raw-particle Lagrangian snapshots as PyG graphs.
-
-    Each graph contains:
-      - data.x        : [N,4] = [x,y,z,field] (normalized if feature_stats given)
-      - data.y        : [N,4] same as x for AE reconstruction
-      - data.pos      : [N,3] physical xyz
-      - data.edge_index
-      - data.params   : [1,P_aug] = [physical params..., t_norm]
-      - data.time     : [1]
-      - data.cloud_id : [N]
-
-    Important:
-      - graphs are always sorted in time within each rev
-      - sampled snapshots preserve time ordering
-    """
     all_graphs: list[Data] = []
     all_times: list[float] = []
 
@@ -424,7 +331,7 @@ def load_lagrangian_snapshots_as_graphs(
     for rev_path in rev_paths:
         meta = _build_rev_snapshot_meta(rev_path, field_variable=field_variable)
         rev_meta[str(rev_path)] = meta
-        all_times.extend([float(s["time"]) for s in meta["snapshots"]])
+        all_times.extend(float(s["time"]) for s in meta["snapshots"])
 
     if not all_times:
         raise RuntimeError("[Lagrangian/Raw] No simulation times found in raw-particle files.")
@@ -450,9 +357,7 @@ def load_lagrangian_snapshots_as_graphs(
 
         sampled_times = np.array([float(s["time"]) for s in snapshots], dtype=np.float64)
         if len(sampled_times) >= 2 and not np.all(np.diff(sampled_times) >= 0):
-            raise ValueError(
-                f"[Lagrangian/Raw] Sampled snapshots not sorted for rev '{rev_name}'"
-            )
+            raise ValueError(f"[Lagrangian/Raw] Sampled snapshots not sorted for rev '{rev_name}'")
 
         for snap in tqdm(
             snapshots,
@@ -493,29 +398,24 @@ def load_lagrangian_snapshots_as_graphs(
                 pos_raw,
                 r=radius,
                 loop=False,
-                max_num_neighbors=16,
+                max_num_neighbors=max_num_neighbors,
             )
 
             if verbose_timing:
                 t4 = time.time()
-
-            t_norm = (tval - t_min) / (t_max - t_min)
-            params_aug = np.concatenate(
-                [param_val, np.array([t_norm], dtype=np.float32)],
-                axis=0,
-            )
 
             data = _build_data_object(
                 pos_raw=pos_raw,
                 field_raw=field_raw,
                 cloud_id=cloud_id,
                 edge_index=edge_index,
-                params_aug=params_aug,
+                params=param_val,
                 tval=tval,
                 snapshot_name=json_path.name,
                 rev_name=rev_name,
                 feature_stats=feature_stats,
             )
+            data.field_raw = field_raw
 
             all_graphs.append(data)
 
@@ -532,14 +432,7 @@ def load_lagrangian_snapshots_as_graphs(
     return all_graphs
 
 
-# ---------------------------------------------------------------------
-# Template / nearest-rev extraction helpers
-# ---------------------------------------------------------------------
-
 def sort_graphs_by_time(graphs: list[Data]) -> list[Data]:
-    """
-    Return graphs sorted by graph.time.
-    """
     if not graphs:
         return []
 
@@ -553,9 +446,6 @@ def sort_graphs_by_time(graphs: list[Data]) -> list[Data]:
 
 
 def get_initial_template_graph(graphs: list[Data]) -> Data:
-    """
-    Return the earliest graph by time.
-    """
     if not graphs:
         raise ValueError("[Lagrangian/Raw] get_initial_template_graph received empty graph list.")
 
@@ -578,23 +468,17 @@ def extract_scaffold_graphs(
     rev_dirs,
     base_data_dir,
     param_mapping,
-    param_train_array,   # kept for API compatibility
+    param_train_array,
     user_param_array,
     field_variable="Particle volume fraction",
     radius=0.1,
     sample_ratio=1.0,
     feature_stats=None,
+    max_num_neighbors: int = 16,
     verbose_timing: bool = False,
 ):
-    """
-    Extract template particle graphs from the rev closest to user_param_array
-    in physical parameter space.
+    del param_train_array
 
-    Important:
-      - despite the historical function name, these are raw particle graphs,
-        not reduced scaffold occupancy graphs
-      - graphs are explicitly sorted by time before return
-    """
     user = np.asarray(user_param_array, dtype=np.float32).reshape(1, -1)
 
     rev_list = list(rev_dirs)
@@ -631,6 +515,7 @@ def extract_scaffold_graphs(
         radius=radius,
         sample_ratio=sample_ratio,
         feature_stats=feature_stats,
+        max_num_neighbors=max_num_neighbors,
         verbose_timing=verbose_timing,
     )
 

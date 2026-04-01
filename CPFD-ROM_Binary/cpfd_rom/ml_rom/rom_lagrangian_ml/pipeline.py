@@ -20,9 +20,6 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
 )
 from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import GraphSnapshotDataset
 from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
-from cpfd_rom.ml_rom.rom_lagrangian_ml.inference import (
-    infer_pointnet_with_latent_regression,
-)
 from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
     LatentRegressorMLP,
     build_latent_regression_dataloaders,
@@ -37,18 +34,11 @@ from cpfd_rom.util.output_utils import setup_output_dir
 
 
 def _normalize_graphs_in_place(graphs, feature_stats):
-    """
-    Normalize x/y in-place using feature_stats, while keeping .pos physical.
-
-    Assumes:
-      - g.x, g.y are [N,4] = [x,y,z,field]
-      - g.pos is physical xyz
-    """
     eps = 1e-8
     pos_mean = feature_stats["pos_mean"]
     pos_std = feature_stats["pos_std"]
-    fmin = feature_stats["field_min"]
-    fmax = feature_stats["field_max"]
+    fmin = float(feature_stats["field_min"])
+    fmax = float(feature_stats["field_max"])
 
     for g in graphs:
         g.x[:, :3] = (g.x[:, :3] - pos_mean) / (pos_std + eps)
@@ -59,7 +49,7 @@ def _normalize_graphs_in_place(graphs, feature_stats):
             g.y[:, 3:4] = (g.y[:, 3:4] - fmin) / (fmax - fmin + eps)
 
 
-def _extract_graph_times(graphs):
+def _extract_graph_times(graphs) -> np.ndarray:
     return np.array([float(g.time.item()) for g in graphs], dtype=np.float64)
 
 
@@ -88,20 +78,209 @@ def _print_template_alignment_summary(scaffold_graphs, matched_times):
     print(f"  last_output_time        : {float(matched_times[-1]):.6f}")
 
 
-def run_lagrangian_ml_pipeline(config, log_time):
-    """
-    Raw-particle Lagrangian ROM pipeline (old particle path, Step-2 cleaned).
+def _compute_time_bounds_from_graphs(graphs) -> tuple[float, float]:
+    times = _extract_graph_times(graphs)
+    t_min = float(times.min())
+    t_max = float(times.max())
+    if t_max <= t_min:
+        raise ValueError("[Lagrangian/Raw] Invalid time range: all graph times are identical.")
+    return t_min, t_max
 
-    Contract
-    --------
-    - Input graphs come from Raw.particle.*.json + .npy
-    - Model learns normalized [x, y, z, field]
-    - Cloud ID is passed through from template graphs
-    - Inference output rows are [x, y, z, Cloud ID, field]
-    - Template graphs come from the nearest training rev
-    - Template graphs are explicitly sorted by time
-    - The nearest rev's true first snapshot is treated as the initialization template
-    """
+
+def _normalize_time_array(times: np.ndarray, t_min: float, t_max: float) -> np.ndarray:
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    if t_max <= t_min:
+        raise ValueError("[Lagrangian/Raw] Cannot normalize time: t_max <= t_min.")
+    return ((times - t_min) / (t_max - t_min)).astype(np.float32)
+
+
+def _denormalize_prediction(
+    pos: torch.Tensor,
+    field: torch.Tensor,
+    feature_stats: dict | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if feature_stats is None:
+        return pos, field
+
+    pos_mean = feature_stats["pos_mean"].to(device=device, dtype=pos.dtype)
+    pos_std = feature_stats["pos_std"].to(device=device, dtype=pos.dtype)
+    pos = pos * (pos_std + 1e-8) + pos_mean
+
+    fmin = float(feature_stats["field_min"])
+    fmax = float(feature_stats["field_max"])
+    field = field * (fmax - fmin + 1e-8) + fmin
+    return pos, field
+
+
+def _extract_latents_and_regression_inputs(
+    model,
+    dataset,
+    device,
+    batch_size: int,
+    t_min: float,
+    t_max: float,
+):
+    latents = []
+    reg_inputs = []
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            recon, z = model(
+                batch.x,
+                batch.edge_index,
+                batch.batch,
+                batch.params,
+                time=batch.time,
+            )
+            del recon
+
+            latents.append(z.detach().cpu())
+
+            time_np = batch.time.view(-1).detach().cpu().numpy()
+            t_norm_np = _normalize_time_array(time_np, t_min=t_min, t_max=t_max)
+            t_norm_t = torch.from_numpy(t_norm_np).view(-1, 1)
+
+            phys_params = batch.params.detach().cpu()
+            reg_inputs.append(torch.cat([phys_params, t_norm_t], dim=1))
+
+    latents_all = torch.cat(latents, dim=0).numpy()
+    reg_inputs_all = torch.cat(reg_inputs, dim=0).numpy()
+    return latents_all, reg_inputs_all
+
+
+def _infer_with_fourier_time(
+    *,
+    user_param,
+    model: torch.nn.Module,
+    latent_regressor: torch.nn.Module,
+    template_graphs: list,
+    feature_stats: dict | None,
+    device: torch.device,
+    batch_size: int,
+    override_times,
+    t_min: float,
+    t_max: float,
+    debug: bool,
+):
+    model = model.to(device).eval()
+    latent_regressor = latent_regressor.to(device).eval()
+
+    override_times = [float(t) for t in override_times]
+    if len(template_graphs) != len(override_times):
+        raise ValueError(
+            f"[Inference] template_graphs ({len(template_graphs)}) and override_times "
+            f"({len(override_times)}) must have the same length."
+        )
+
+    loader = DataLoader(
+        template_graphs,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    preds_list: list[np.ndarray] = []
+    times_out: list[float] = []
+
+    user_param_vec = np.asarray(user_param, dtype=np.float32).reshape(-1)
+    graph_counter = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+
+            if not hasattr(batch, "params"):
+                raise AttributeError("[Inference] batch is missing 'params'.")
+            if not hasattr(batch, "time"):
+                raise AttributeError("[Inference] batch is missing 'time'.")
+            if not hasattr(batch, "cloud_id"):
+                raise AttributeError("[Inference] batch is missing 'cloud_id'.")
+
+            B = int(batch.params.shape[0])
+
+            t_actual = torch.tensor(
+                override_times[graph_counter:graph_counter + B],
+                dtype=torch.float32,
+                device=device,
+            ).view(-1, 1)
+
+            t_norm = torch.tensor(
+                _normalize_time_array(
+                    np.asarray(override_times[graph_counter:graph_counter + B], dtype=np.float64),
+                    t_min=t_min,
+                    t_max=t_max,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ).view(-1, 1)
+
+            user_phys = (
+                torch.tensor(user_param_vec, dtype=torch.float32, device=device)
+                .view(1, -1)
+                .repeat(B, 1)
+            )
+
+            reg_in = torch.cat([user_phys, t_norm], dim=1)
+            z_pred = latent_regressor(reg_in)
+
+            recon = model.decode(
+                latent_z=z_pred,
+                template_x=batch.x[:, :4],
+                edge_index=batch.edge_index,
+                batch=batch.batch,
+                params=user_phys,
+                time=t_actual,
+            )
+
+            batch_vec = batch.batch
+
+            for g_idx in range(B):
+                mask = batch_vec == g_idx
+                recon_g = recon[mask]
+
+                pos = recon_g[:, :3]
+                field = recon_g[:, 3:4]
+
+                pos, field = _denormalize_prediction(
+                    pos=pos,
+                    field=field,
+                    feature_stats=feature_stats,
+                    device=device,
+                )
+
+                cid = batch.cloud_id[mask].to(device).float().view(-1, 1)
+                out_g = torch.cat([pos, cid, field], dim=1)
+
+                preds_list.append(out_g.cpu().numpy())
+
+                tval = float(override_times[graph_counter])
+                times_out.append(tval)
+
+                if debug and graph_counter < 3:
+                    print(f"[Inference][Graph {graph_counter}]")
+                    print(f"  template_time          : {float(batch.time.view(-1)[g_idx].item()):.6f}")
+                    print(f"  output_time            : {tval:.6f}")
+                    print(f"  template_nodes         : {int(mask.sum().item())}")
+                    print(f"  predicted_xyz_min      : {pos.min(dim=0).values.detach().cpu().numpy()}")
+                    print(f"  predicted_xyz_max      : {pos.max(dim=0).values.detach().cpu().numpy()}")
+                    print(f"  predicted_field_minmax : ({field.min().item():.6e}, {field.max().item():.6e})")
+
+                graph_counter += 1
+
+    return preds_list, times_out
+
+
+def run_lagrangian_ml_pipeline(config, log_time):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
 
@@ -111,10 +290,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
 
-    # ----------------------------------------------------------
-    # Config
-    # ----------------------------------------------------------
-    batch_size = int(getattr(config, "batch_size", 2))
+    batch_size = int(getattr(config, "batch_size", 1))
     latent_dim = int(getattr(config, "latent_dim", 32))
     hidden_dim = int(getattr(config, "hidden_dim", 64))
     num_gnn_layers = int(getattr(config, "num_gnn_layers", 2))
@@ -123,25 +299,25 @@ def run_lagrangian_ml_pipeline(config, log_time):
     learning_rate = float(getattr(config, "learning_rate", 1e-3))
     sample_ratio = float(getattr(config, "sample_ratio", 0.05))
     graph_radius = float(getattr(config, "graph_radius", 0.001))
+    max_num_neighbors = int(getattr(config, "max_num_neighbors", 16))
 
-    # AE training knobs
     grad_clip_norm = float(getattr(config, "grad_clip_norm", 1.0))
     field_loss_weight = float(getattr(config, "field_loss_weight", 1.0))
     com_loss_weight = float(getattr(config, "com_loss_weight", 0.0))
     spread_loss_weight = float(getattr(config, "spread_loss_weight", 0.0))
 
-    # Latent regressor knobs
     latent_reg_epochs = int(getattr(config, "latent_reg_epochs", 50))
     latent_reg_lr = float(getattr(config, "latent_reg_lr", 1e-3))
     latent_reg_weight_decay = float(getattr(config, "latent_reg_weight_decay", 1e-4))
     latent_reg_patience = int(getattr(config, "latent_reg_patience", 5))
     latent_reg_hidden_dims = getattr(config, "latent_reg_hidden_dims", [128, 64])
 
-    # Inference/debug knobs
+    num_time_bands = int(getattr(config, "num_time_bands", 8))
+    max_time_freq = float(getattr(config, "max_time_freq", 10.0))
+    include_raw_time = bool(getattr(config, "include_raw_time", True))
+    use_bn = bool(getattr(config, "use_bn", True))
+
     inference_debug = bool(getattr(config, "inference_debug", True))
-    inference_time_alignment_atol = float(
-        getattr(config, "inference_time_alignment_atol", 1e-8)
-    )
 
     if not getattr(config, "rev_dirs", None):
         raise ValueError("[Lagrangian/Raw] config.rev_dirs must be provided.")
@@ -157,9 +333,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
     user_param_arr = _as_1d_user_param_array(config.user_parameter)
     print(f"[INFO] user_parameter = {user_param_arr}")
 
-    # ==========================================================
-    # 1) LOAD TRAINING GRAPHS ONCE (RAW), COMPUTE STATS, NORMALIZE
-    # ==========================================================
     with log_time("Loading raw-particle training graphs"):
         graphs = load_lagrangian_snapshots_as_graphs(
             rev_dirs=config.rev_dirs,
@@ -169,11 +342,15 @@ def run_lagrangian_ml_pipeline(config, log_time):
             radius=graph_radius,
             sample_ratio=sample_ratio,
             feature_stats=None,
+            max_num_neighbors=max_num_neighbors,
             verbose_timing=False,
         )
 
         if len(graphs) == 0:
             raise RuntimeError("[Lagrangian/Raw] No graphs loaded.")
+
+    t_min, t_max = _compute_time_bounds_from_graphs(graphs)
+    print(f"[INFO] Training time range      : [{t_min:.6f}, {t_max:.6f}]")
 
     with log_time("Computing feature stats and normalizing training graphs"):
         feature_stats = compute_feature_stats(graphs)
@@ -181,9 +358,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     dataset = GraphSnapshotDataset(graphs)
 
-    # ==========================================================
-    # 2) TRAIN / VAL SPLIT
-    # ==========================================================
     indices = np.arange(len(dataset))
     train_idx, _val_idx = train_test_split(
         indices,
@@ -193,11 +367,9 @@ def run_lagrangian_ml_pipeline(config, log_time):
     )
     train_set = torch.utils.data.Subset(dataset, train_idx)
 
-    # ==========================================================
-    # 3) BUILD AE
-    # ==========================================================
     sample = dataset[0]
     param_dim = int(sample.params.shape[1])
+    latent_reg_in_dim = param_dim + 1
 
     model = PointNetGNNAutoencoder(
         in_dim=4,
@@ -206,11 +378,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
         hidden_dim=hidden_dim,
         out_dim=4,
         num_gnn_layers=num_gnn_layers,
+        num_time_bands=num_time_bands,
+        max_time_freq=max_time_freq,
+        include_raw_time=include_raw_time,
+        use_bn=use_bn,
     ).to(device)
 
-    # ==========================================================
-    # 4) TRAIN AE (or load)
-    # ==========================================================
     if getattr(config, "skip_training", False) and os.path.exists(model_path):
         with log_time("Loading pretrained AE model"):
             print(f"[INFO] Loading pretrained AE model from {model_path}")
@@ -229,44 +402,26 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 com_loss_weight=com_loss_weight,
                 spread_loss_weight=spread_loss_weight,
             )
-
         torch.save(model.state_dict(), model_path)
         print(f"[INFO] Saved AE model to {model_path}")
 
     model.eval()
 
-    # ==========================================================
-    # 5) EXTRACT LATENTS FOR LATENT REGRESSION
-    # ==========================================================
-    latents = []
-    params_all = []
-
     with log_time("Extracting AE latents"):
-        loader_lat = DataLoader(
-            dataset,
+        latents_all, reg_inputs_all = _extract_latents_and_regression_inputs(
+            model=model,
+            dataset=dataset,
+            device=device,
             batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
+            t_min=t_min,
+            t_max=t_max,
         )
 
-        with torch.no_grad():
-            for batch in loader_lat:
-                batch = batch.to(device)
-                _recon, z = model(batch.x, batch.edge_index, batch.batch, batch.params)
-                latents.append(z.detach().cpu())
-                params_all.append(batch.params.detach().cpu())
-
-    latents_all = torch.cat(latents, dim=0).numpy()
-    params_all = torch.cat(params_all, dim=0).numpy()
-
     print(f"[INFO] Latent matrix shape     : {latents_all.shape}")
-    print(f"[INFO] Params matrix shape     : {params_all.shape}")
+    print(f"[INFO] Regressor input shape  : {reg_inputs_all.shape}")
 
-    # ==========================================================
-    # 6) TRAIN LATENT REGRESSOR
-    # ==========================================================
     train_loader_reg, val_loader_reg = build_latent_regression_dataloaders(
-        params_aug=params_all,
+        params_aug=reg_inputs_all,
         latents=latents_all,
         batch_size=batch_size,
         val_fraction=0.2,
@@ -275,7 +430,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     )
 
     latent_reg_model = LatentRegressorMLP(
-        in_dim=param_dim,
+        in_dim=latent_reg_in_dim,
         latent_dim=latent_dim,
         hidden_dims=latent_reg_hidden_dims,
     ).to(device)
@@ -296,46 +451,36 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 weight_decay=latent_reg_weight_decay,
                 patience=latent_reg_patience,
             )
-
         torch.save(latent_reg_model.state_dict(), latent_reg_path)
         print(f"[INFO] Saved latent regressor to {latent_reg_path}")
 
     latent_reg_model.eval()
 
-    # ----------------------------------------------------------
-    # Cleanup training data memory
-    # ----------------------------------------------------------
-    del dataset
     del train_set
-    del latents
+    del train_loader_reg
+    del val_loader_reg
     del latents_all
-    del params_all
+    del reg_inputs_all
     gc.collect()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    del graphs
-    gc.collect()
-
-    # ==========================================================
-    # 7) EXTRACT TEMPLATE PARTICLE GRAPHS FROM NEAREST REV
-    # ==========================================================
     with log_time("Extracting nearest-rev template graphs"):
         template_graphs = extract_scaffold_graphs(
             rev_dirs=config.rev_dirs,
             base_data_dir=config.base_data_dir,
             param_mapping=config.param_mapping,
-            param_train_array=None,  # kept for API compatibility
+            param_train_array=None,
             user_param_array=config.user_parameter,
             field_variable=config.field_variable,
             radius=graph_radius,
             sample_ratio=sample_ratio,
             feature_stats=feature_stats,
+            max_num_neighbors=max_num_neighbors,
             verbose_timing=False,
         )
 
-    # Explicit time sort and initialization confirmation
     template_graphs = sort_graphs_by_time(template_graphs)
     g0 = get_initial_template_graph(template_graphs)
 
@@ -344,15 +489,13 @@ def run_lagrangian_ml_pipeline(config, log_time):
     print(f"  first_template_time     : {float(g0.time.item()):.6f}")
     print(f"  num_template_graphs     : {len(template_graphs)}")
 
-    # ==========================================================
-    # 7b) BUILD REFERENCE TIME AXIS
-    # ==========================================================
     reference_time_rev = getattr(config, "reference_time_rev", config.rev_dirs[0])
 
     ref_times = load_lagrangian_snapshot_times(
         rev_dir=reference_time_rev,
         base_data_dir=config.base_data_dir,
         sample_ratio=sample_ratio,
+        field_variable=config.field_variable,
     )
     ref_times = _validate_reference_times(ref_times)
 
@@ -361,17 +504,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
         f"with {len(ref_times)} sorted reference times"
     )
 
-    # ==========================================================
-    # 7c) ALIGN TEMPLATE GRAPHS TO REFERENCE TIMES
-    # ==========================================================
     if len(template_graphs) != len(ref_times):
         raise ValueError(
             f"[Lagrangian/Raw] template graphs ({len(template_graphs)}) and "
             f"reference times ({len(ref_times)}) have different lengths."
         )
 
-    # For the old particle code path, keep strict index-based alignment,
-    # but now after explicit sorting on both sides.
     matched_graphs = list(template_graphs)
     matched_times = [float(t) for t in ref_times]
 
@@ -385,31 +523,26 @@ def run_lagrangian_ml_pipeline(config, log_time):
         f"to {len(matched_times)} reference times"
     )
 
-    # ==========================================================
-    # 8) INFERENCE
-    # ==========================================================
     with log_time("Running Lagrangian ROM inference"):
-        preds, times = infer_pointnet_with_latent_regression(
+        preds, times = _infer_with_fourier_time(
             user_param=config.user_parameter,
             model=model,
             latent_regressor=latent_reg_model,
-            scaffold_graphs=matched_graphs,
-            output_dir=config.output_dir,
-            field_variable=config.field_variable,
+            template_graphs=matched_graphs,
             feature_stats=feature_stats,
             device=device,
             batch_size=1,
             override_times=matched_times,
-            time_alignment_atol=inference_time_alignment_atol,
+            t_min=t_min,
+            t_max=t_max,
             debug=inference_debug,
         )
 
     del matched_graphs
+    del dataset
+    del graphs
     gc.collect()
 
-    # ==========================================================
-    # 9) WRITE OUTPUT
-    # ==========================================================
     out_dir = os.path.join(config.output_dir, "Lagrangian_ROM")
     os.makedirs(out_dir, exist_ok=True)
 

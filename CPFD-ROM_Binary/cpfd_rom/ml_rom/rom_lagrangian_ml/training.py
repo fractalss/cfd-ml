@@ -3,16 +3,7 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-
 def _forward_pointnet_gnn(model, batch, device):
-    """
-    batch: PyG Batch with:
-      - batch.x:         [N_total, 4] normalized [x, y, z, field]
-      - batch.y:         [N_total, 4] target
-      - batch.edge_index:[2, E]
-      - batch.batch:     [N_total] graph index per node
-      - batch.params:    [B, P_aug] graph-level conditioning params
-    """
     batch = batch.to(device)
 
     x = batch.x
@@ -29,9 +20,10 @@ def _forward_pointnet_gnn(model, batch, device):
     if edge_index is None:
         raise ValueError("[train] batch.edge_index is missing.")
 
-    recon, graph_latent = model(x, edge_index, batch_idx, params)
-    return recon, target, graph_latent, batch_idx
+    time = batch.time if hasattr(batch, "time") else None
 
+    recon, graph_latent = model(x, edge_index, batch_idx, params, time=time)
+    return recon, target, graph_latent, batch_idx
 
 def _batch_com_and_spread_loss(pred_xyz, true_xyz, batch_idx):
     """

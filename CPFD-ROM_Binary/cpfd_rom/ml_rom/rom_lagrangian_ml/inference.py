@@ -209,6 +209,7 @@ def infer_pointnet_with_latent_regression(
             batch_vec = batch.batch  # [N_total]
 
             # Graph-level times from template graphs
+            # Graph-level times from template graphs
             if hasattr(batch, "time"):
                 t_batch = batch.time.view(-1)
                 if t_batch.numel() != B:
@@ -219,6 +220,14 @@ def infer_pointnet_with_latent_regression(
             else:
                 t_batch = None
 
+            recon = model.decode(
+                z_pred,
+                batch.x[:, :4],
+                batch.edge_index,
+                batch.batch,
+                p_aug,
+                time=t_batch,
+            )
             # Optional graph-level names if preserved by batch collation
             has_snapshot_name = hasattr(batch, "snapshot_name")
 
