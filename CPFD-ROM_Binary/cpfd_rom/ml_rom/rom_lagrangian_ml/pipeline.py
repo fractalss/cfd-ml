@@ -290,7 +290,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
 
-    batch_size = int(getattr(config, "batch_size", 1))
+    batch_size = int(getattr(config, "batch_size", 2))
     latent_dim = int(getattr(config, "latent_dim", 32))
     hidden_dim = int(getattr(config, "hidden_dim", 64))
     num_gnn_layers = int(getattr(config, "num_gnn_layers", 2))
