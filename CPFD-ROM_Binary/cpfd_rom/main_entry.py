@@ -4,10 +4,38 @@ from __future__ import annotations
 import gc
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import time
+import random
 from contextlib import contextmanager
 
+import numpy as np
+import torch
+
 from cpfd_rom.util.config import load_config
+
+
+def set_seed(seed: int) -> None:
+    """
+    Set global random seeds for reproducible or ensemble training.
+
+    Different seed values produce different model initializations and
+    training trajectories. This is useful for ensemble-based UQ.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # Keep these False for performance unless you need strict reproducibility.
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+    print(f"[MAIN] Global seed set to {seed}")
 
 
 @contextmanager
@@ -23,6 +51,9 @@ def log_time(task_name: str):
 def clear_memory():
     gc.collect()
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def run_from_config_path(config_path: str) -> int:
     """
@@ -37,6 +68,12 @@ def run_from_config_path(config_path: str) -> int:
     try:
         cfg = load_config(config_path)
 
+        # ------------------------------------------------------------
+        # Global seed for reproducibility / UQ ensemble runs
+        # ------------------------------------------------------------
+        seed = int(getattr(cfg, "seed", getattr(cfg, "shuffle_seed", 42)))
+        set_seed(seed)
+
         # Prepend base_data_dir to rev_dirs if relative
         if getattr(cfg, "base_data_dir", None) and getattr(cfg, "rev_dirs", None):
             cfg.rev_dirs = [
@@ -49,6 +86,7 @@ def run_from_config_path(config_path: str) -> int:
             "rom_type=", getattr(cfg, "rom_type", None),
             "type_of_field=", getattr(cfg, "type_of_field", None),
             "field_variable=", getattr(cfg, "field_variable", None),
+            "seed=", seed,
         )
 
         rom_type = str(getattr(cfg, "rom_type", "")).strip()
