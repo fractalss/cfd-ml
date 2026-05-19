@@ -1,9 +1,13 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/pipeline_old.py
+# cpfd_rom/ml_rom/rom_lagrangian_ml/pipeline.py
 
 from __future__ import annotations
 
 import gc
+import json
 import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -31,6 +35,11 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import (
 from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
 from cpfd_rom.util.model_utils import setup_model_paths
 from cpfd_rom.util.output_utils import setup_output_dir
+
+
+# -----------------------------------------------------------------------------
+# Small utilities
+# -----------------------------------------------------------------------------
 
 
 def _normalize_graphs_in_place(graphs, feature_stats):
@@ -111,6 +120,76 @@ def _denormalize_prediction(
     fmax = float(feature_stats["field_max"])
     field = field * (fmax - fmin + 1e-8) + fmin
     return pos, field
+
+
+def _safe_json_value(value: Any):
+    """Convert config values into JSON-safe objects for ablation records."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_safe_json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _config_to_dict(config) -> dict[str, Any]:
+    """Best-effort config dump that works for argparse, SimpleNamespace, and custom objects."""
+    if isinstance(config, dict):
+        raw = config
+    else:
+        raw = {
+            k: v
+            for k, v in vars(config).items()
+            if not k.startswith("_")
+        }
+    return {str(k): _safe_json_value(v) for k, v in raw.items()}
+
+
+def _write_ablation_metadata(
+    *,
+    run_record_path: str,
+    ablation_name: str,
+    ablation_group: str,
+    config,
+    model_path: str,
+    latent_reg_path: str,
+    out_dir: str,
+    device: torch.device,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    num_graphs: int | None = None,
+    num_template_graphs: int | None = None,
+    status: str = "running",
+):
+    record = {
+        "ablation_name": ablation_name,
+        "ablation_group": ablation_group,
+        "status": status,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "device": str(device),
+        "model_path": model_path,
+        "latent_regressor_path": latent_reg_path,
+        "output_dir": out_dir,
+        "training_time_min": t_min,
+        "training_time_max": t_max,
+        "num_training_graphs": num_graphs,
+        "num_template_graphs": num_template_graphs,
+        "config": _config_to_dict(config),
+    }
+
+    os.makedirs(os.path.dirname(run_record_path), exist_ok=True)
+    with open(run_record_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+
+
+# -----------------------------------------------------------------------------
+# Latent extraction and inference
+# -----------------------------------------------------------------------------
 
 
 def _extract_latents_and_regression_inputs(
@@ -280,6 +359,11 @@ def _infer_with_fourier_time(
     return preds_list, times_out
 
 
+# -----------------------------------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------------------------------
+
+
 def run_lagrangian_ml_pipeline(config, log_time):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
@@ -287,9 +371,43 @@ def run_lagrangian_ml_pipeline(config, log_time):
     setup_output_dir(config)
     setup_model_paths(config)
 
-    model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
-    latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
+    # ------------------------------------------------------------------
+    # Ablation identity and run directories
+    # ------------------------------------------------------------------
+    ablation_name = str(getattr(config, "ablation_name", "A0_full_model"))
+    ablation_group = str(getattr(config, "ablation_group", "baseline"))
+    ablation_root_name = str(getattr(config, "ablation_root_name", "ablation_runs"))
 
+
+    ablation_model_dir = os.path.join(
+        config.model_dir,
+        ablation_root_name,
+        ablation_group,
+        ablation_name,
+    )
+    ablation_output_dir = os.path.join(
+        config.output_dir,
+        ablation_root_name,
+        ablation_group,
+        ablation_name,
+    )
+    os.makedirs(ablation_model_dir, exist_ok=True)
+    os.makedirs(ablation_output_dir, exist_ok=True)
+
+    model_path = os.path.join(ablation_model_dir, "pointnet_gnn_lagrangian.pt")
+    latent_reg_path = os.path.join(ablation_model_dir, "latent_regressor.pt")
+    run_record_path = os.path.join(ablation_output_dir, "ablation_run_record.json")
+    print("[ABLATION] ------------------------------------------------------------")
+    print(f"[ABLATION] Group            : {ablation_group}")
+    print(f"[ABLATION] Case name        : {ablation_name}")
+    print(f"[ABLATION] Root folder      : {ablation_root_name}")
+    print(f"[ABLATION] Model dir        : {ablation_model_dir}")
+    print(f"[ABLATION] Output dir       : {ablation_output_dir}")
+    print("[ABLATION] ------------------------------------------------------------")
+
+    # ------------------------------------------------------------------
+    # Standard config reads
+    # ------------------------------------------------------------------
     batch_size = int(getattr(config, "batch_size", 2))
     latent_dim = int(getattr(config, "latent_dim", 32))
     hidden_dim = int(getattr(config, "hidden_dim", 64))
@@ -319,6 +437,19 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     inference_debug = bool(getattr(config, "inference_debug", True))
 
+    # Print the key ablation controls so logs are self-documenting.
+    print("[ABLATION] Active controls")
+    print(f"  num_gnn_layers       : {num_gnn_layers}")
+    print(f"  num_time_bands       : {num_time_bands}")
+    print(f"  include_raw_time     : {include_raw_time}")
+    print(f"  field_loss_weight    : {field_loss_weight}")
+    print(f"  com_loss_weight      : {com_loss_weight}")
+    print(f"  spread_loss_weight   : {spread_loss_weight}")
+    print(f"  sample_ratio         : {sample_ratio}")
+    print(f"  graph_radius         : {graph_radius}")
+    print(f"  max_num_neighbors    : {max_num_neighbors}")
+    print(f"  use_bn               : {use_bn}")
+
     if not getattr(config, "rev_dirs", None):
         raise ValueError("[Lagrangian/Raw] config.rev_dirs must be provided.")
     if not hasattr(config, "base_data_dir"):
@@ -332,6 +463,19 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     user_param_arr = _as_1d_user_param_array(config.user_parameter)
     print(f"[INFO] user_parameter = {user_param_arr}")
+
+    # Initial metadata write, useful even if the run fails later.
+    _write_ablation_metadata(
+        run_record_path=run_record_path,
+        ablation_name=ablation_name,
+        ablation_group=ablation_group,
+        config=config,
+        model_path=model_path,
+        latent_reg_path=latent_reg_path,
+        out_dir=ablation_output_dir,
+        device=device,
+        status="running",
+    )
 
     with log_time("Loading raw-particle training graphs"):
         graphs = load_lagrangian_snapshots_as_graphs(
@@ -351,6 +495,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     t_min, t_max = _compute_time_bounds_from_graphs(graphs)
     print(f"[INFO] Training time range      : [{t_min:.6f}, {t_max:.6f}]")
+    print(f"[INFO] Number of training graphs: {len(graphs)}")
 
     with log_time("Computing feature stats and normalizing training graphs"):
         feature_stats = compute_feature_stats(graphs)
@@ -384,6 +529,13 @@ def run_lagrangian_ml_pipeline(config, log_time):
         use_bn=use_bn,
     ).to(device)
 
+    print("[MODEL] PointNetGNNAutoencoder initialized")
+    print(f"  param_dim             : {param_dim}")
+    print(f"  latent_dim            : {latent_dim}")
+    print(f"  hidden_dim            : {hidden_dim}")
+    print(f"  model.time_dim        : {getattr(model, 'time_dim', '<missing>')}")
+    print(f"  model.cond_dim        : {getattr(model, 'cond_dim', '<missing>')}")
+
     if getattr(config, "skip_training", False) and os.path.exists(model_path):
         with log_time("Loading pretrained AE model"):
             print(f"[INFO] Loading pretrained AE model from {model_path}")
@@ -407,16 +559,23 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     model.eval()
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    latent_extract_batch_size = int(getattr(config, "latent_extract_batch_size", batch_size))
+
     with log_time("Extracting AE latents"):
         latents_all, reg_inputs_all = _extract_latents_and_regression_inputs(
             model=model,
             dataset=dataset,
             device=device,
-            batch_size=batch_size,
+            batch_size=latent_extract_batch_size,
             t_min=t_min,
             t_max=t_max,
         )
 
+    print(f"[INFO] Latent extraction batch : {latent_extract_batch_size}")
     print(f"[INFO] Latent matrix shape     : {latents_all.shape}")
     print(f"[INFO] Regressor input shape  : {reg_inputs_all.shape}")
 
@@ -538,12 +697,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
             debug=inference_debug,
         )
 
-    del matched_graphs
-    del dataset
-    del graphs
-    gc.collect()
+    # Capture counts before cleanup.
+    num_graphs = len(graphs)
+    num_template_graphs = len(matched_graphs)
 
-    out_dir = os.path.join(config.output_dir, "Lagrangian_ROM")
+    # Final output folder for Tecplot-style particles_*.txt files.
+    out_dir = os.path.join(ablation_output_dir, "Lagrangian_ROM")
     os.makedirs(out_dir, exist_ok=True)
 
     write_lagrangian_rom_only(
@@ -554,4 +713,30 @@ def run_lagrangian_ml_pipeline(config, log_time):
         time_mode="raw",
     )
 
+    # Final metadata update after successful inference.
+    _write_ablation_metadata(
+        run_record_path=run_record_path,
+        ablation_name=ablation_name,
+        ablation_group=ablation_group,
+        config=config,
+        model_path=model_path,
+        latent_reg_path=latent_reg_path,
+        out_dir=out_dir,
+        device=device,
+        t_min=t_min,
+        t_max=t_max,
+        num_graphs=num_graphs,
+        num_template_graphs=num_template_graphs,
+        status="completed",
+    )
+
+    del matched_graphs
+    del dataset
+    del graphs
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print(f"[INFO] ROM inference complete. Output saved to: {out_dir}")
+    print(f"[ABLATION] Run record saved to: {run_record_path}")
