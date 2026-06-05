@@ -2,7 +2,7 @@
 *.pyc
 *.log
 *.npy
-*.txt
+.txt
 .vscode/
 .idea/
 *.pkl
@@ -17,7 +17,7 @@ dist/
 *.c
 *.so
 *.pyd
-*.cpp
+.cpp
 # Python virtual environments
 venv/
 **/venv/
