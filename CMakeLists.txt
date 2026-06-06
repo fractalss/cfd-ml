@@ -50,28 +50,40 @@ unset(Python3_STDLIB CACHE)
 # =================================================================
 # PASS 2: Lock onto the VENV Explicitly
 # =================================================================
+# Note on requirements files:
+# these are generated on linux and windows from the build image using the following steps
+# from a master requirements.in file
+# 1.  Activate the venv in src/bvr-rom (source ./venv/bin/activate  or ./venv/Scripts/Activate.bat)
+# 2.  Install pip-tools if not present (pip install pip-tools)
+# 3.  pip-compile --upgrade requirements.in
+# 4.  copy the generated requirements.txt to either requirements-linux.txt or requirements-windows.txt
+
 if(WIN32)
     set(Python3_EXECUTABLE "${VENV_DIR}/Scripts/python.exe")
+    set(REQUIREMENTS_FILE "requirements-windows.txt")
 else()
     set(Python3_EXECUTABLE "${VENV_DIR}/bin/python")
+    set(REQUIREMENTS_FILE "requirements-linux.txt")
 endif()
 
 set(Python3_FIND_STRATEGY LOCATION)
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+cpfd_add_to_inuse_manifest(Python ${Python3_VERSION})
 
 # =================================================================
 # RIGHT HERE: Run Pip Install Requirements
 # =================================================================
 # Now that we know Python3_EXECUTABLE is 100% pointing to the venv,
 # we use it to safely install our packages.
-message(STATUS "Installing Python packages from requirements.txt...")
+message(STATUS "Installing Python packages from ${REQUIREMENTS_FILE}...")
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" -m pip install --upgrade pip setuptools wheel
     RESULT_VARIABLE PIP_RET
 )
+
 execute_process(
     COMMAND ${CMAKE_COMMAND} -E env
-    "${Python3_EXECUTABLE}" -m pip install -r "${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt"
+    "${Python3_EXECUTABLE}" -m pip install -r "${CMAKE_CURRENT_SOURCE_DIR}/${REQUIREMENTS_FILE}"
     RESULT_VARIABLE PIP_RET
 )
 
@@ -105,7 +117,6 @@ execute_process(
 file(TO_CMAKE_PATH "${STDLIB_DIR}" STDLIB_DIR)
 
 # --- 3. PATH SETUP ---
-set(REQUIREMENTS_FILE "${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt")
 set(PACKAGE_PARENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/CPFD-ROM_Binary")
 set(PY_ENTRY_POINT "${PACKAGE_PARENT_DIR}/cpfd_rom/rom_cli.py")
 set(NUITKA_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/nuitka_out")
