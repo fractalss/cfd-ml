@@ -162,11 +162,15 @@ set_target_properties(cpfd_rom_cli PROPERTIES
     CXX_EXTENSIONS OFF
 )
 
+cpfd_configure_version_header(cpfd_rom_cli)
+
 target_sources(cpfd_rom_cli
     PRIVATE
+        exeinfo.cpp
         main.cpp
         pythonmanager.cpp
     PUBLIC
+        exeinfo.h
         pythonmanager.h
 
     PRIVATE
@@ -178,12 +182,15 @@ target_link_libraries(cpfd_rom_cli
     Python3::Python           # The Interpreter Core
     PUBLIC
     licensemanager
+    ${Boost_LIBRARIES}
 )
 
-target_include_directories(cpfd_rom_cli PRIVATE ${Python3_INCLUDE_DIRS}
+target_include_directories(cpfd_rom_cli PRIVATE
+    ${Python3_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src"     # Allows #include "libdir/header.h"
-            "${CMAKE_BINARY_DIR}/include"        # Path for generated headers
-        )
+    "${CMAKE_BINARY_DIR}/include"        # Path for generated headers
+    )
+target_include_directories(cpfd_rom_cli SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
 
 # Ensure Nuitka finishes before the C++ linker starts
 add_dependencies(cpfd_rom_cli nuitka_static_target)
