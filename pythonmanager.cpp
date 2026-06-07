@@ -103,10 +103,9 @@ PythonManager::~PythonManager() {
     }
 }
 
-
-
 void PythonManager::handleStatus(const PyStatus& status, const std::string& msg) {
     if (PyStatus_Exception(status)) {
+        std::cout << msg << std::endl;
         Py_ExitStatusException(status); // This handles the fatal exit for you
     }
 }
