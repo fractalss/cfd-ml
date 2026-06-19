@@ -16,7 +16,8 @@ import yaml
 rom_type: Optional[str] = None
 field_variable: Optional[str] = None
 type_of_field: Optional[str] = None
-user_parameter: Optional[float] = None
+user_parameter: Optional[Any] = None
+user_parameters: Optional[Iterable[float]] = None
 target_times: Optional[Iterable[float]] = None
 base_data_dir: Optional[str] = None
 rev_dirs: Optional[Iterable[str]] = None
@@ -36,6 +37,21 @@ def _to_float(v: Any, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+def _to_float_or_float_list(v: Any, default: float = 0.0):
+    """Return either a float or a list of floats.
+
+    Supports:
+      user_parameter: 9.0
+      user_parameter: [9.0, 11.0, 10.5]
+      user_parameters: [9.0, 11.0, 10.5]
+    """
+    if v is None:
+        return float(default)
+
+    if isinstance(v, (list, tuple)):
+        return [_to_float(x, default=default) for x in v]
+
+    return _to_float(v, default=default)
 
 def _to_int(v: Any, default: int = 0) -> int:
     try:
@@ -92,8 +108,21 @@ class ROMConfig(SimpleNamespace):
 
     # Numeric casts for key fields
     def _normalize_core(self) -> None:
+
         if hasattr(self, "user_parameter"):
-            setattr(self, "user_parameter", _to_float(getattr(self, "user_parameter")))
+            setattr(
+                self,
+                "user_parameter",
+                _to_float_or_float_list(getattr(self, "user_parameter")),
+            )
+
+        if hasattr(self, "user_parameters"):
+            vals = getattr(self, "user_parameters")
+            if isinstance(vals, (list, tuple)):
+                setattr(self, "user_parameters", [_to_float(v) for v in vals])
+            elif vals is not None:
+                setattr(self, "user_parameters", [_to_float(vals)])
+
         # param_mapping ? float values
         pm = getattr(self, "param_mapping", None)
         if isinstance(pm, dict):
@@ -144,8 +173,13 @@ def overlay_cli(cfg: ROMConfig, **overrides: Any) -> ROMConfig:
         if v is None:
             continue
         # Coerce common keys
-        if k in {"user_parameter", "fourier_m", "gat_heads"}:
-            v = _to_int(v) if k in {"fourier_m", "gat_heads"} else _to_float(v)
+
+        if k in {"fourier_m", "gat_heads"}:
+            v = _to_int(v)
+
+        if k in {"user_parameter", "user_parameters"}:
+            v = _to_float_or_float_list(v)
+
         if k in {"add_time", "skip_training", "rebuild_graph"}:
             v = _to_bool(v)
         if k in {"conv_type", "time_mode"}:
