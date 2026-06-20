@@ -235,6 +235,42 @@ install(FILES "${NUITKA_OUTPUT_DIR}/${NUITKA_LIB}"
         RENAME "rom_cli.${NUITKA_LIB_EXT}"
         COMPONENT cpfd_rom_tool)
 
+
+set(GLOBAL_EXCLUDES
+   # PATTERN "__pycache__" EXCLUDE
+    PATTERN "*.h" EXCLUDE
+    PATTERN "*.hpp" EXCLUDE
+    PATTERN "*.c" EXCLUDE
+    PATTERN "*.cpp" EXCLUDE
+    PATTERN "*.cuh" EXCLUDE
+    PATTERN "*.h.in" EXCLUDE
+    PATTERN "tests" EXCLUDE
+    PATTERN "test" EXCLUDE
+    PATTERN "_examples" EXCLUDE
+    PATTERN "examples" EXCLUDE
+    PATTERN "benchmarks" EXCLUDE
+    PATTERN "categories" EXCLUDE
+    PATTERN "cupy" EXCLUDE
+    PATTERN "dask" EXCLUDE
+    PATTERN "include" EXCLUDE
+    PATTERN "share" EXCLUDE
+)
+
+set(STDLIB_EXCLUDES
+    PATTERN "tkinter" EXCLUDE     # Graphical User Interface layout tool (Heavy!)
+    PATTERN "ensurepip" EXCLUDE    # Internal pip bootstrapper (Unused at runtime)
+    PATTERN "pydoc_data" EXCLUDE   # In-terminal documentation data
+    PATTERN "idlelib" EXCLUDE      # Python's built-in text editor
+    PATTERN "turtle.py" EXCLUDE    # Educational drawing module
+    PATTERN "test" EXCLUDE         # Python's internal regression test suites
+    PATTERN "sqlite3" EXCLUDE
+    PATTERN "xmlrpc" EXCLUDE
+    PATTERN "lib2to3" EXCLUDE
+    PATTERN "wsgiref" EXCLUDE
+    PATTERN "macholib" EXCLUDE
+    PATTERN "venv" EXCLUDE
+)
+
 #python dll / so
 if(WIN32)
     get_target_property(PYTHON_DLL_PATH Python3::Python IMPORTED_LOCATION)
@@ -260,7 +296,10 @@ endif()
 #python stdlib
 install(DIRECTORY "${STDLIB_DIR}/"
         DESTINATION "lib/python_stdlib"
-        COMPONENT cpfd_rom_tool)
+        COMPONENT cpfd_rom_tool
+        ${GLOBAL_EXCLUDES}
+        ${STDLIB_EXCLUDES}
+        )
 
 if(WIN32)
 
@@ -275,18 +314,26 @@ if(WIN32)
 
     install(DIRECTORY "${REAL_SYSTEM_DLLS}/"
             DESTINATION "lib/python_dlls"
-            COMPONENT cpfd_rom_tool)
+            COMPONENT cpfd_rom_tool
+            ${GLOBAL_EXCLUDES}
+            )
 else()
     # 1. Copy the system's actual lib-dynload binary extensions folder
     install(DIRECTORY "${REAL_SYSTEM_STDLIB}/lib-dynload"
             DESTINATION "lib/python_stdlib"
-            COMPONENT cpfd_rom_tool)
+            COMPONENT cpfd_rom_tool
+            ${GLOBAL_EXCLUDES}
+            )
 
     # 2. Make sure you also grab the standard library pure .py files from the host system
     install(DIRECTORY "${REAL_SYSTEM_STDLIB}/"
             DESTINATION "lib/python_stdlib"
             COMPONENT cpfd_rom_tool
-            FILES_MATCHING PATTERN "*.py")
+            FILES_MATCHING
+            ${GLOBAL_EXCLUDES}
+           ${STDLIB_EXCLUDES}
+            PATTERN "*.py"
+            )
 
     find_library(LIBFFI_PATH
         NAMES ffi libffi.so.6 libffi.so
@@ -364,7 +411,9 @@ foreach(PKG ${PKGS_TO_COPY})
         message(STATUS "Packaging Python directory module: ${PKG}")
         install(DIRECTORY "${CLEAN_PKG_DIR}"
                 DESTINATION "lib"
-                COMPONENT cpfd_rom_tool)
+                COMPONENT cpfd_rom_tool
+                ${GLOBAL_EXCLUDES}
+                )
 
         # Check for companion binary libraries (.libs)
         set(SRC_LIBS_DIR "${VENV_DIR}/${RELATIVE_SITE_PACKAGES}/${PKG}.libs")
@@ -372,7 +421,9 @@ foreach(PKG ${PKGS_TO_COPY})
         if(EXISTS "${CLEAN_LIBS_DIR}")
             install(DIRECTORY "${CLEAN_LIBS_DIR}"
                     DESTINATION "lib"
-                    COMPONENT cpfd_rom_tool)
+                    COMPONENT cpfd_rom_tool
+                    ${GLOBAL_EXCLUDES}
+                    )
         endif()
 
     # Case B: It's a pure-Python single file module (e.g., typing_extensions.py)
@@ -392,6 +443,7 @@ foreach(PKG ${PKGS_TO_COPY})
                 DESTINATION "lib"
                 COMPONENT cpfd_rom_tool
                 FILES_MATCHING
+                ${GLOBAL_EXCLUDES}
                 PATTERN "*.so*" # Ensure all shared objects are aggressively retained
                 PATTERN "*.py"
         )
@@ -402,7 +454,9 @@ if (NOT WIN32)
     # 1. Standard install loop copies 'nvidia' normally
     install(DIRECTORY "${VENV_DIR}/${RELATIVE_SITE_PACKAGES}/nvidia"
             DESTINATION "lib"
-            COMPONENT cpfd_rom_tool)
+            COMPONENT cpfd_rom_tool
+            ${GLOBAL_EXCLUDES}
+            )
 
     # 2. Add an installation rule to prune the dead weight right before packaging
     install(CODE [[
