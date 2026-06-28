@@ -397,7 +397,7 @@ endif()
 
 # python packages
 set(PKGS_TO_COPY yaml numpy pandas torch torch_geometric tqdm sklearn trimesh matplotlib typing_extensions torchgen pytz dateutil six sympy
-                 pyarrow fastparquet certifi idna urllib3 requests markupsafe jinja2 psutil fsspec mpmath  xxhash  )
+                 pyarrow fastparquet certifi idna urllib3 requests markupsafe jinja2 psutil fsspec mpmath  xxhash  cusparselt)
 
 foreach(PKG ${PKGS_TO_COPY})
     # Define paths for both possibilities

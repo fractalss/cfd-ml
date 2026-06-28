@@ -4,9 +4,11 @@
 #
 #    pip-compile '..\..\..\code\src\bvr-rom\requirements.in'
 #
+--extra-index-url https://download-r2.pytorch.org/whl/cu124
+
 aiohappyeyeballs==2.6.2
     # via aiohttp
-aiohttp==3.14.0
+aiohttp==3.14.1
     # via torch-geometric
 aiosignal==1.4.0
     # via aiohttp
@@ -14,7 +16,7 @@ attrs==26.1.0
     # via
     #   aiohttp
     #   cyclopts
-certifi==2026.5.20
+certifi==2026.6.17
     # via requests
 charset-normalizer==3.4.7
     # via requests
@@ -26,13 +28,13 @@ cramjam==2.11.0
     # via fastparquet
 cycler==0.12.1
     # via matplotlib
-cyclopts==4.16.1
+cyclopts==4.19.0
     # via pyvista
 docstring-parser==0.18.0
     # via cyclopts
 fastparquet==2026.5.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-filelock==3.29.1
+filelock==3.29.4
     # via torch
 fonttools==4.63.0
     # via matplotlib
@@ -40,7 +42,7 @@ frozenlist==1.8.0
     # via
     #   aiohttp
     #   aiosignal
-fsspec==2026.4.0
+fsspec==2026.6.0
     # via
     #   fastparquet
     #   torch
@@ -61,7 +63,7 @@ markdown-it-py==4.2.0
     # via rich
 markupsafe==3.0.3
     # via jinja2
-matplotlib==3.10.9
+matplotlib==3.11.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   pyvista
@@ -80,9 +82,9 @@ networkx==3.6.1
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   torch
-nuitka==4.1.2
+nuitka==4.1.3
     # via -r ../../../code/src/bvr-rom/requirements.in
-numpy==2.4.6
+numpy==2.5.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   contourpy
@@ -99,7 +101,7 @@ packaging==26.2
     #   fastparquet
     #   matplotlib
     #   pooch
-pandas==3.0.3
+pandas==3.0.4
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   fastparquet
@@ -143,13 +145,13 @@ rich==15.0.0
     # via
     #   cyclopts
     #   rich-rst
-rich-rst==2.0.1
+rich-rst==2.0.2
     # via cyclopts
 rtree==1.4.1
     # via -r ../../../code/src/bvr-rom/requirements.in
 scikit-learn==1.9.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-scipy==1.17.1
+scipy==1.18.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   scikit-learn
@@ -157,15 +159,15 @@ scooby==0.11.2
     # via pyvista
 six==1.17.0
     # via python-dateutil
-sympy==1.14.0
+sympy==1.13.1
     # via torch
 threadpoolctl==3.6.0
     # via scikit-learn
-torch==2.12.0
+torch==2.6.0+cu124
     # via -r ../../../code/src/bvr-rom/requirements.in
 torch-geometric==2.8.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-tqdm==4.68.1
+tqdm==4.68.3
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   torch-geometric
@@ -185,7 +187,7 @@ vtk==9.6.2
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   pyvista
-xxhash==3.7.0
+xxhash==3.8.0
     # via torch-geometric
 yarl==1.24.2
     # via aiohttp
