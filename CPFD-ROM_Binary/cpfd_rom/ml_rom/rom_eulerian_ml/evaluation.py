@@ -62,7 +62,7 @@ def _write_rom_only(
             y = y.reshape(-1)
 
         df = key.copy()
-        df[field_name_eff] = y
+        df.loc[:, field_name_eff] = y
         # Sort to i-fastest (k outermost) order for output
         df = df.sort_values(by=["k", "j", "i"], kind="mergesort")
 
