@@ -1,4 +1,7 @@
 # Core ML & Math
+## we want cuda 12 to continue support for volta cards
+--extra-index-url https://download.pytorch.org/whl/cu129
+
 torch
 torch-geometric
 scikit-learn

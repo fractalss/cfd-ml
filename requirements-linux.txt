@@ -4,9 +4,11 @@
 #
 #    pip-compile ../../../code/src/bvr-rom/requirements.in
 #
+--extra-index-url https://download.pytorch.org/whl/cu129
+
 aiohappyeyeballs==2.6.2
     # via aiohttp
-aiohttp==3.14.0
+aiohttp==3.14.1
     # via torch-geometric
 aiosignal==1.4.0
     # via aiohttp
@@ -14,7 +16,7 @@ attrs==26.1.0
     # via
     #   aiohttp
     #   cyclopts
-certifi==2026.5.20
+certifi==2026.6.17
     # via requests
 charset-normalizer==3.4.7
     # via requests
@@ -22,21 +24,21 @@ contourpy==1.3.3
     # via matplotlib
 cramjam==2.11.0
     # via fastparquet
-cuda-bindings==13.3.1
+cuda-bindings==12.9.7
     # via torch
 cuda-pathfinder==1.5.5
     # via cuda-bindings
-cuda-toolkit[cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2
+cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.9.1
     # via torch
 cycler==0.12.1
     # via matplotlib
-cyclopts==4.16.1
+cyclopts==4.19.0
     # via pyvista
 docstring-parser==0.18.0
     # via cyclopts
 fastparquet==2026.5.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-filelock==3.29.1
+filelock==3.29.4
     # via torch
 fonttools==4.63.0
     # via matplotlib
@@ -44,7 +46,7 @@ frozenlist==1.8.0
     # via
     #   aiohttp
     #   aiosignal
-fsspec==2026.4.0
+fsspec==2026.6.0
     # via
     #   fastparquet
     #   torch
@@ -65,7 +67,7 @@ markdown-it-py==4.2.0
     # via rich
 markupsafe==3.0.3
     # via jinja2
-matplotlib==3.10.9
+matplotlib==3.11.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   pyvista
@@ -84,9 +86,9 @@ networkx==3.6.1
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   torch
-nuitka==4.1.2
+nuitka==4.1.3
     # via -r ../../../code/src/bvr-rom/requirements.in
-numpy==2.4.6
+numpy==2.5.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   contourpy
@@ -98,53 +100,51 @@ numpy==2.4.6
     #   scipy
     #   torch-geometric
     #   trimesh
-nvidia-cublas==13.1.1.3
-    # via
-    #   nvidia-cudnn-cu13
-    #   nvidia-cusolver
-    #   torch
-nvidia-cuda-cupti==13.0.85
-    # via cuda-toolkit
-nvidia-cuda-nvrtc==13.0.88
+nvidia-cublas-cu12==12.9.1.4
     # via
     #   cuda-toolkit
-    #   nvidia-cublas
-nvidia-cuda-runtime==13.0.96
+    #   nvidia-cudnn-cu12
+    #   nvidia-cusolver-cu12
+nvidia-cuda-cupti-cu12==12.9.79
     # via cuda-toolkit
-nvidia-cudnn-cu13==9.20.0.48
+nvidia-cuda-nvrtc-cu12==12.9.86
+    # via cuda-toolkit
+nvidia-cuda-runtime-cu12==12.9.79
+    # via cuda-toolkit
+nvidia-cudnn-cu12==9.20.0.48
     # via torch
-nvidia-cufft==12.0.0.61
+nvidia-cufft-cu12==11.4.1.4
     # via cuda-toolkit
-nvidia-cufile==1.15.1.6
+nvidia-cufile-cu12==1.14.1.1
     # via cuda-toolkit
-nvidia-curand==10.4.0.35
+nvidia-curand-cu12==10.3.10.19
     # via cuda-toolkit
-nvidia-cusolver==12.0.4.66
+nvidia-cusolver-cu12==11.7.5.82
     # via cuda-toolkit
-nvidia-cusparse==12.6.3.3
+nvidia-cusparse-cu12==12.5.10.65
     # via
     #   cuda-toolkit
-    #   nvidia-cusolver
-nvidia-cusparselt-cu13==0.8.1
+    #   nvidia-cusolver-cu12
+nvidia-cusparselt-cu12==0.8.1
     # via torch
-nvidia-nccl-cu13==2.29.7
+nvidia-nccl-cu12==2.29.7
     # via torch
-nvidia-nvjitlink==13.0.88
+nvidia-nvjitlink-cu12==12.9.86
     # via
     #   cuda-toolkit
-    #   nvidia-cufft
-    #   nvidia-cusolver
-    #   nvidia-cusparse
-nvidia-nvshmem-cu13==3.4.5
+    #   nvidia-cufft-cu12
+    #   nvidia-cusolver-cu12
+    #   nvidia-cusparse-cu12
+nvidia-nvshmem-cu12==3.4.5
     # via torch
-nvidia-nvtx==13.0.85
+nvidia-nvtx-cu12==12.9.79
     # via cuda-toolkit
 packaging==26.2
     # via
     #   fastparquet
     #   matplotlib
     #   pooch
-pandas==3.0.3
+pandas==3.0.4
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   fastparquet
@@ -188,13 +188,13 @@ rich==15.0.0
     # via
     #   cyclopts
     #   rich-rst
-rich-rst==2.0.1
+rich-rst==2.0.2
     # via cyclopts
 rtree==1.4.1
     # via -r ../../../code/src/bvr-rom/requirements.in
 scikit-learn==1.9.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-scipy==1.17.1
+scipy==1.18.0
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   scikit-learn
@@ -206,17 +206,17 @@ sympy==1.14.0
     # via torch
 threadpoolctl==3.6.0
     # via scikit-learn
-torch==2.12.0
+torch==2.12.1+cu129
     # via -r ../../../code/src/bvr-rom/requirements.in
 torch-geometric==2.8.0
     # via -r ../../../code/src/bvr-rom/requirements.in
-tqdm==4.68.1
+tqdm==4.68.3
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   torch-geometric
 trimesh==4.12.2
     # via -r ../../../code/src/bvr-rom/requirements.in
-triton==3.7.0
+triton==3.7.1
     # via torch
 typing-extensions==4.15.0
     # via
@@ -230,7 +230,7 @@ vtk==9.6.2
     # via
     #   -r ../../../code/src/bvr-rom/requirements.in
     #   pyvista
-xxhash==3.7.0
+xxhash==3.8.0
     # via torch-geometric
 yarl==1.24.2
     # via aiohttp
