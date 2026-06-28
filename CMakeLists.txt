@@ -116,6 +116,16 @@ execute_process(
 
 file(TO_CMAKE_PATH "${STDLIB_DIR}" STDLIB_DIR)
 
+option(CPFD_ENABLE_PYTHON_WARNINGS "Enable and display Python runtime warnings" OFF)
+
+if(CPFD_ENABLE_PYTHON_WARNINGS)
+    message(STATUS "Python warnings are ENABLED (Development Mode)")
+    add_compile_definitions(PYTHON_WARNINGS_ENABLED=1)
+else()
+    message(STATUS "Python warnings are STRIPPED/SILENCED (Production Mode)")
+    add_compile_definitions(PYTHON_WARNINGS_ENABLED=0)
+endif()
+
 # --- 3. PATH SETUP ---
 set(PACKAGE_PARENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/CPFD-ROM_Binary")
 set(PY_ENTRY_POINT "${PACKAGE_PARENT_DIR}/cpfd_rom/rom_cli.py")
@@ -132,6 +142,7 @@ set(NUITKA_FLAGS
     --module
     --include-package=cpfd_rom
     --follow-import-to=cpfd_rom
+    --deployment
     --output-dir="${NUITKA_OUTPUT_DIR}"
     --report=${CMAKE_CURRENT_BINARY_DIR}/compilation_report.json
     --jobs=${N_CORES}

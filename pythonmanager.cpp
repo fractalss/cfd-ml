@@ -87,6 +87,21 @@ PythonManager::PythonManager(int argc, char* argv[]) {
 
     config.configure_c_stdio = 1; // Align standard I/O streams with this behavior
 
+#if !PYTHON_WARNINGS_ENABLED
+        // 1. Production Mode: Silence all python warnings
+    status = PyWideStringList_Append(&config.warnoptions, L"ignore");
+    handleStatus(status, "Cannot silence all warnings for production");
+
+    // 2. Production Mode: Set optimization level to 1 (-O) or 2 (-OO)
+    // This strips assert statements and docstrings to further harden the binary
+    config.optimization_level = 1;
+#else
+        // Development Mode: Force all warnings to show
+    status = PyWideStringList_Append(&config.warnoptions, L"default");
+    handleStatus(status, "Cannot enable all warnings for production");
+#endif
+
+
     // 3. Initialize Engine
     status = Py_InitializeFromConfig(&config);
     handleStatus(status, "Failed to initialize Python Engine");
