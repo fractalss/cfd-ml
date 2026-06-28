@@ -331,7 +331,7 @@ else()
             COMPONENT cpfd_rom_tool
             FILES_MATCHING
             ${GLOBAL_EXCLUDES}
-           ${STDLIB_EXCLUDES}
+            ${STDLIB_EXCLUDES}
             PATTERN "*.py"
             )
 
@@ -455,48 +455,22 @@ if (NOT WIN32)
     install(DIRECTORY "${VENV_DIR}/${RELATIVE_SITE_PACKAGES}/nvidia"
             DESTINATION "lib"
             COMPONENT cpfd_rom_tool
-            ${GLOBAL_EXCLUDES}
+            FILES_MATCHING
+            PATTERN "libcublasLt.so.*"
+            PATTERN "libcublas.so.*"
+            PATTERN "libcudart.so.*"
+            PATTERN "libcudnn.so.*"
+            PATTERN "libcufile.so.*"
+            PATTERN "libnvJitLink.so.*"
+            PATTERN "libnvshmem_host.so.*"
+            PATTERN "libnvrtc.so.*"
+            PATTERN "libcupti.so.*"
+            PATTERN "libcusparse.so.*"
+            PATTERN "libcusparseLt.so.*"
+            PATTERN "libcufft.so.*"
+            PATTERN "libnccl.so.*"
+            PATTERN "libcurand.so.*"
+            PATTERN "libcudnn_graph.so.*"
             )
-
-    # 2. Add an installation rule to prune the dead weight right before packaging
-    install(CODE [[
-        message(STATUS "SLIMMING INSTALLER: Purging unused heavy CUDA binaries...")
-
-        # Define the exact path inside your CPack staging area
-        set(CUDA_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib/nvidia/cu13/lib")
-
-        if(EXISTS "${CUDA_LIB_DIR}")
-            # A. Clean out heavy static archive files (.a) which are never needed at runtime
-            file(GLOB STATIC_ARCHIVES "${CUDA_LIB_DIR}/*.a")
-            if(STATIC_ARCHIVES)
-                file(REMOVE ${STATIC_ARCHIVES})
-            endif()
-
-            # B. Clean out unused optional shared libraries (.so)
-            # Add or remove items from this list based on your testing!
-            set(LIBS_TO_REMOVE
-                "libcufftw"
-                "libcusolver"
-                "libcusolverMg"
-                "libnvrtc-builtins"
-                "libnvblas"
-                "libcheckpoint"
-                "libcufile_rdma"
-                "libnvrtc-builtins.alt"
-                "libnvrtc.alt"
-                "libnvtx3interop"
-                "libnvperf_host"
-                "libpcsamplingutil"
-                "libnvperf_target"
-            )
-
-            foreach(LIB_NAME ${LIBS_TO_REMOVE})
-                file(GLOB TARGET_FILES "${CUDA_LIB_DIR}/${LIB_NAME}.so*")
-                if(TARGET_FILES)
-                    file(REMOVE ${TARGET_FILES})
-                endif()
-            endforeach()
-        endif()
-    ]] COMPONENT cpfd_rom_tool)
 
 endif()
