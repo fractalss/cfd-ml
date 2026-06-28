@@ -476,10 +476,8 @@ if (NOT WIN32)
             # Add or remove items from this list based on your testing!
             set(LIBS_TO_REMOVE
                 "libcufftw"
-                "libcurand"
                 "libcusolver"
                 "libcusolverMg"
-                "libcusparse"
                 "libnvrtc-builtins"
                 "libnvblas"
                 "libcheckpoint"
