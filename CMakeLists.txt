@@ -244,6 +244,7 @@ set(GLOBAL_EXCLUDES
     PATTERN "*.cpp" EXCLUDE
     PATTERN "*.cuh" EXCLUDE
     PATTERN "*.h.in" EXCLUDE
+    PATTERN "*.lib" EXCLUDE
     PATTERN "tests" EXCLUDE
     PATTERN "test" EXCLUDE
     PATTERN "_examples" EXCLUDE
