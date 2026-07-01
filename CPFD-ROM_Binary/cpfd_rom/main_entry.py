@@ -54,10 +54,17 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-def run_from_config_path(config_path: str) -> int:
+def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
     """
     Internal ROM engine entrypoint used by rom-cli-bin.
+
+    Parameters
+    ----------
+    config_path:
+        Path to ROM YAML configuration file.
+
+    infer_only:
+        If True, skip model training and run inference using an existing model.
 
     Return codes:
       0 success
@@ -67,6 +74,20 @@ def run_from_config_path(config_path: str) -> int:
 
     try:
         cfg = load_config(config_path)
+
+        # ------------------------------------------------------------
+        # CLI-level mode override
+        # ------------------------------------------------------------
+        if infer_only:
+            setattr(cfg, "skip_training", True)
+            setattr(cfg, "infer_only", True)
+            # model_path = getattr(cfg, "model_path", None)
+            # if not model_path:
+            #     raise ValueError(
+            #         "--infer-only requires model_path to be defined in the YAML config."
+            #     )
+        else:
+            setattr(cfg, "infer_only", False)
 
         # ------------------------------------------------------------
         # Global seed for reproducibility / UQ ensemble runs
@@ -87,6 +108,8 @@ def run_from_config_path(config_path: str) -> int:
             "type_of_field=", getattr(cfg, "type_of_field", None),
             "field_variable=", getattr(cfg, "field_variable", None),
             "seed=", seed,
+            "infer_only=", getattr(cfg, "infer_only", False),
+            "skip_training=", getattr(cfg, "skip_training", False),
         )
 
         rom_type = str(getattr(cfg, "rom_type", "")).strip()
@@ -102,7 +125,8 @@ def run_from_config_path(config_path: str) -> int:
 
         else:
             raise ValueError(
-                f"Unsupported ROM type / field type: rom_type={rom_type}, type_of_field={field_type}"
+                f"Unsupported ROM type / field type: "
+                f"rom_type={rom_type}, type_of_field={field_type}"
             )
 
         clear_memory()

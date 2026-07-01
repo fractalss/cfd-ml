@@ -134,6 +134,7 @@ class ROMConfig(SimpleNamespace):
 
         # booleans
         setattr(self, "skip_training", _to_bool(getattr(self, "skip_training", False)))
+        setattr(self, "infer_only", _to_bool(getattr(self, "infer_only", False)))
         setattr(self, "rebuild_graph", _to_bool(getattr(self, "rebuild_graph", False)))
 
     def normalize(self) -> "ROMConfig":
@@ -180,7 +181,7 @@ def overlay_cli(cfg: ROMConfig, **overrides: Any) -> ROMConfig:
         if k in {"user_parameter", "user_parameters"}:
             v = _to_float_or_float_list(v)
 
-        if k in {"add_time", "skip_training", "rebuild_graph"}:
+        if k in {"add_time", "skip_training", "infer_only","rebuild_graph"}:
             v = _to_bool(v)
         if k in {"conv_type", "time_mode"}:
             v = _lower_strip(v)

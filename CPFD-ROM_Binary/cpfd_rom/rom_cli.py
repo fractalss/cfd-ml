@@ -17,9 +17,23 @@ def main() -> int:
         required=True,
         help="Path to YAML file with all configuration options.",
     )
+    parser.add_argument(
+        "--infer-only",
+        action="store_true",
+        help=(
+            "Run inference only using an existing trained model. "
+            "This overrides skip_training=True in the loaded config."
+        ),
+    )
 
     args = parser.parse_args()
-    return int(run_from_config_path(args.config_path))
+
+    return int(
+        run_from_config_path(
+            args.config_path,
+            infer_only=args.infer_only,
+        )
+    )
 
 
 if __name__ == "__main__":
