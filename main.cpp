@@ -6,7 +6,7 @@
 #include "license-manager/license-manager/licensemanager.h"
 
 // todo, require ROM license
-License::Type licenseType = License::Type::BvrBaseSolver;
+License::Type licenseType = License::Type::CpfdRomTraining;
 
 int main(int argc, char* argv[]) {
 

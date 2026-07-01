@@ -12,6 +12,7 @@
 build/
 dist/
 *.egg-info/
+CMakeLists.txt.user
 
 # Cython/compiled artifacts
 *.c
