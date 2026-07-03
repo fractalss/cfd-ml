@@ -398,7 +398,8 @@ endif()
 
 # python packages
 set(PKGS_TO_COPY yaml numpy pandas torch torch_geometric tqdm sklearn trimesh matplotlib typing_extensions torchgen pytz dateutil six sympy
-                 pyarrow fastparquet certifi idna urllib3 requests markupsafe jinja2 psutil fsspec mpmath  xxhash  cusparselt)
+                 pyarrow fastparquet certifi idna urllib3 requests markupsafe jinja2 psutil fsspec mpmath  xxhash  cusparselt scipy joblib narwhals
+                 threadpoolctl scikit_learn.libs pyg_lib)
 
 foreach(PKG ${PKGS_TO_COPY})
     # Define paths for both possibilities
@@ -474,4 +475,21 @@ if (NOT WIN32)
             PATTERN "libcudnn_graph.so.*"
             )
 
+    file(GLOB LOOSE_SO_FILES "${VENV_DIR}/${RELATIVE_SITE_PACKAGES}/*.so*")
+
+    if(LOOSE_SO_FILES)
+        message(STATUS "Packaging loose root site-package binaries: ${LOOSE_SO_FILES}")
+        install(FILES ${LOOSE_SO_FILES}
+                DESTINATION "lib"
+                COMPONENT cpfd_rom_tool)
+    endif()
+else ()
+    file(GLOB LOOSE_SO_FILES "${VENV_DIR}/${RELATIVE_SITE_PACKAGES}/*.pyd*")
+
+    if(LOOSE_SO_FILES)
+        message(STATUS "Packaging loose root site-package binaries: ${LOOSE_SO_FILES}")
+        install(FILES ${LOOSE_SO_FILES}
+                DESTINATION "lib"
+                COMPONENT cpfd_rom_tool)
+    endif()
 endif()
