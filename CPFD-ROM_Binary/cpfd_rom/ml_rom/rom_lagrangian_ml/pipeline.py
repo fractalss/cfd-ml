@@ -1,5 +1,3 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/pipeline_old.py
-
 from __future__ import annotations
 
 import gc
@@ -53,10 +51,44 @@ def _extract_graph_times(graphs) -> np.ndarray:
     return np.array([float(g.time.item()) for g in graphs], dtype=np.float64)
 
 
-def _as_1d_user_param_array(user_parameter) -> np.ndarray:
+def _as_single_parameter_request_list(user_parameter) -> list[np.ndarray]:
+    """
+    Interpret config.user_parameter for a single-parameter Lagrangian ROM.
+
+    Supported YAML examples:
+
+        user_parameter: 0.300
+
+    and:
+
+        user_parameter: [0.300, 0.400, 0.500]
+
+    Both are converted into a list of 1D parameter vectors:
+
+        [array([0.300]), array([0.400]), array([0.500])]
+
+    This intentionally does NOT interpret [0.300, 0.400, 0.500]
+    as one 3-component parameter vector. This file is for the current
+    single-parameter Lagrangian ROM only.
+    """
     if np.isscalar(user_parameter):
-        return np.array([float(user_parameter)], dtype=np.float32)
-    return np.asarray(user_parameter, dtype=np.float32).reshape(-1)
+        return [np.array([float(user_parameter)], dtype=np.float32)]
+
+    arr = np.asarray(user_parameter, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("[Lagrangian/Raw] config.user_parameter is empty.")
+
+    return [np.array([float(v)], dtype=np.float32) for v in arr]
+
+
+def _format_rom_param_dir(user_param_vec: np.ndarray) -> str:
+    """Return folder name such as ROM_param_0.300 for a scalar parameter."""
+    vals = np.asarray(user_param_vec, dtype=np.float32).reshape(-1)
+    if vals.size != 1:
+        raise ValueError(
+            f"[Lagrangian/Raw] Expected one scalar parameter, got shape {vals.shape}."
+        )
+    return f"ROM_param_{float(vals[0]):.3f}"
 
 
 def _validate_reference_times(ref_times: np.ndarray) -> np.ndarray:
@@ -193,6 +225,12 @@ def _infer_with_fourier_time(
     times_out: list[float] = []
 
     user_param_vec = np.asarray(user_param, dtype=np.float32).reshape(-1)
+    if user_param_vec.size != 1:
+        raise ValueError(
+            f"[Inference] This revised pipeline expects one scalar user parameter. "
+            f"Got shape {user_param_vec.shape}."
+        )
+
     graph_counter = 0
 
     with torch.no_grad():
@@ -216,7 +254,10 @@ def _infer_with_fourier_time(
 
             t_norm = torch.tensor(
                 _normalize_time_array(
-                    np.asarray(override_times[graph_counter:graph_counter + B], dtype=np.float64),
+                    np.asarray(
+                        override_times[graph_counter:graph_counter + B],
+                        dtype=np.float64,
+                    ),
                     t_min=t_min,
                     t_max=t_max,
                 ),
@@ -268,6 +309,7 @@ def _infer_with_fourier_time(
 
                 if debug and graph_counter < 3:
                     print(f"[Inference][Graph {graph_counter}]")
+                    print(f"  user_parameter         : {float(user_param_vec[0]):.6f}")
                     print(f"  template_time          : {float(batch.time.view(-1)[g_idx].item()):.6f}")
                     print(f"  output_time            : {tval:.6f}")
                     print(f"  template_nodes         : {int(mask.sum().item())}")
@@ -330,8 +372,10 @@ def run_lagrangian_ml_pipeline(config, log_time):
     if not hasattr(config, "user_parameter"):
         raise ValueError("[Lagrangian/Raw] config.user_parameter must be set.")
 
-    user_param_arr = _as_1d_user_param_array(config.user_parameter)
-    print(f"[INFO] user_parameter = {user_param_arr}")
+    user_param_requests = _as_single_parameter_request_list(config.user_parameter)
+    print("[INFO] Requested Lagrangian scalar user_parameter values:")
+    for pvec in user_param_requests:
+        print(f"  {float(pvec[0]):.6f}")
 
     with log_time("Loading raw-particle training graphs"):
         graphs = load_lagrangian_snapshots_as_graphs(
@@ -369,6 +413,12 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     sample = dataset[0]
     param_dim = int(sample.params.shape[1])
+    if param_dim != 1:
+        raise ValueError(
+            f"[Lagrangian/Raw] This revised pipeline supports single-parameter ROMs only. "
+            f"The loaded dataset has param_dim={param_dim}."
+        )
+
     latent_reg_in_dim = param_dim + 1
 
     model = PointNetGNNAutoencoder(
@@ -466,29 +516,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    with log_time("Extracting nearest-rev template graphs"):
-        template_graphs = extract_scaffold_graphs(
-            rev_dirs=config.rev_dirs,
-            base_data_dir=config.base_data_dir,
-            param_mapping=config.param_mapping,
-            param_train_array=None,
-            user_param_array=config.user_parameter,
-            field_variable=config.field_variable,
-            radius=graph_radius,
-            sample_ratio=sample_ratio,
-            feature_stats=feature_stats,
-            max_num_neighbors=max_num_neighbors,
-            verbose_timing=False,
-        )
-
-    template_graphs = sort_graphs_by_time(template_graphs)
-    g0 = get_initial_template_graph(template_graphs)
-
-    print("[TemplateInit] Nearest-rev template initialization confirmed")
-    print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
-    print(f"  first_template_time     : {float(g0.time.item()):.6f}")
-    print(f"  num_template_graphs     : {len(template_graphs)}")
-
     reference_time_rev = getattr(config, "reference_time_rev", config.rev_dirs[0])
 
     ref_times = load_lagrangian_snapshot_times(
@@ -504,54 +531,109 @@ def run_lagrangian_ml_pipeline(config, log_time):
         f"with {len(ref_times)} sorted reference times"
     )
 
-    if len(template_graphs) != len(ref_times):
-        raise ValueError(
-            f"[Lagrangian/Raw] template graphs ({len(template_graphs)}) and "
-            f"reference times ({len(ref_times)}) have different lengths."
+    lagrangian_root_out = os.path.join(config.output_dir, "Lagrangian_ROM")
+    os.makedirs(lagrangian_root_out, exist_ok=True)
+
+    for user_param_vec in user_param_requests:
+        param_dir_name = _format_rom_param_dir(user_param_vec)
+        out_dir = os.path.join(lagrangian_root_out, param_dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        print("=" * 80)
+        print(
+            f"[INFO] Running Lagrangian ROM inference for "
+            f"user_parameter = {float(user_param_vec[0]):.6f}"
+        )
+        print(f"[INFO] Output directory: {out_dir}")
+
+        with log_time(f"Extracting nearest-rev template graphs for {param_dir_name}"):
+            template_graphs = extract_scaffold_graphs(
+                rev_dirs=config.rev_dirs,
+                base_data_dir=config.base_data_dir,
+                param_mapping=config.param_mapping,
+                param_train_array=None,
+                user_param_array=user_param_vec,
+                field_variable=config.field_variable,
+                radius=graph_radius,
+                sample_ratio=sample_ratio,
+                feature_stats=feature_stats,
+                max_num_neighbors=max_num_neighbors,
+                verbose_timing=False,
+            )
+
+        template_graphs = sort_graphs_by_time(template_graphs)
+        g0 = get_initial_template_graph(template_graphs)
+
+        print("[TemplateInit] Nearest-rev template initialization confirmed")
+        print(f"  user_parameter          : {float(user_param_vec[0]):.6f}")
+        print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
+        print(f"  first_template_time     : {float(g0.time.item()):.6f}")
+        print(f"  num_template_graphs     : {len(template_graphs)}")
+
+        if len(template_graphs) != len(ref_times):
+            raise ValueError(
+                f"[Lagrangian/Raw] template graphs ({len(template_graphs)}) and "
+                f"reference times ({len(ref_times)}) have different lengths "
+                f"for user_parameter={float(user_param_vec[0]):.6f}."
+            )
+
+        matched_graphs = list(template_graphs)
+        matched_times = [float(t) for t in ref_times]
+
+        _print_template_alignment_summary(matched_graphs, matched_times)
+
+        del template_graphs
+        gc.collect()
+
+        print(
+            f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
+            f"to {len(matched_times)} reference times"
         )
 
-    matched_graphs = list(template_graphs)
-    matched_times = [float(t) for t in ref_times]
+        with log_time(f"Running Lagrangian ROM inference for {param_dir_name}"):
+            preds, times = _infer_with_fourier_time(
+                user_param=user_param_vec,
+                model=model,
+                latent_regressor=latent_reg_model,
+                template_graphs=matched_graphs,
+                feature_stats=feature_stats,
+                device=device,
+                batch_size=1,
+                override_times=matched_times,
+                t_min=t_min,
+                t_max=t_max,
+                debug=inference_debug,
+            )
 
-    _print_template_alignment_summary(matched_graphs, matched_times)
-
-    del template_graphs
-    gc.collect()
-
-    print(
-        f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
-        f"to {len(matched_times)} reference times"
-    )
-
-    with log_time("Running Lagrangian ROM inference"):
-        preds, times = _infer_with_fourier_time(
-            user_param=config.user_parameter,
-            model=model,
-            latent_regressor=latent_reg_model,
-            template_graphs=matched_graphs,
-            feature_stats=feature_stats,
-            device=device,
-            batch_size=1,
-            override_times=matched_times,
-            t_min=t_min,
-            t_max=t_max,
-            debug=inference_debug,
+        write_lagrangian_rom_only(
+            preds=preds,
+            times=times,
+            field_variable=config.field_variable,
+            out_dir=out_dir,
+            time_mode="raw",
         )
 
-    del matched_graphs
+        print(
+            f"[INFO] ROM inference complete for user_parameter="
+            f"{float(user_param_vec[0]):.6f}. Output saved to: {out_dir}"
+        )
+
+        del matched_graphs
+        del preds
+        del times
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     del dataset
     del graphs
     gc.collect()
 
-    out_dir = os.path.join(config.output_dir, "Lagrangian_ROM")
-    os.makedirs(out_dir, exist_ok=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    write_lagrangian_rom_only(
-        preds=preds,
-        times=times,
-        field_variable=config.field_variable,
-        out_dir=out_dir,
-        time_mode="raw",
+    print(
+        f"[INFO] All Lagrangian ROM inference cases complete. "
+        f"Root output: {lagrangian_root_out}"
     )
-
-    print(f"[INFO] ROM inference complete. Output saved to: {out_dir}")
