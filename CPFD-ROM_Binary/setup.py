@@ -75,19 +75,25 @@ setup(
         ]
     },
     install_requires=[
-        "torch==2.2.2",
+        "torch==2.6.0",
         "torch-geometric==2.7.0",
-        "scikit-learn==1.7.2",
-        "numpy==1.26.4",
-        "pandas==2.3.3",
-        "scipy==1.16.3",
-        "matplotlib==3.10.7",
-        "tqdm==4.67.1",
-        "networkx==3.5",
+        "scikit-learn==1.9.0",
+        "numpy==2.5.0",
+        "pandas==3.0.4",
+        "scipy==1.18.0",
+        "matplotlib==3.11.0",
+        "tqdm==4.68.3",
+        "networkx==3.6.1",
         "pyyaml==6.0.3",
+        "pyarrow==24.0.0",
+        "fastparquet==2026.5.0",
+        "xxhash==3.8.0",
+        "threadpoolctl==3.6.0",
     ],
+
     extras_require={
         "lagrangian": [
+            "pyg-lib",
             "torch_scatter",
             "torch_sparse",
             "torch_cluster",
