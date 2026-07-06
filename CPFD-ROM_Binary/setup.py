@@ -74,18 +74,6 @@ setup(
             "rom-cli-bin=cpfd_rom.rom_cli:main",
         ]
     },
-    # install_requires=[
-    #     "torch==2.2.2",
-    #     "torch-geometric==2.7.0",
-    #     "scikit-learn==1.7.2",
-    #     "numpy==1.26.4",
-    #     "pandas==2.3.3",
-    #     "scipy==1.16.3",
-    #     "matplotlib==3.10.7",
-    #     "tqdm==4.67.1",
-    #     "networkx==3.5",
-    #     "pyyaml==6.0.3",
-    # ],
     install_requires=[
         "torch==2.6.0",
         "torch-geometric==2.7.0",
@@ -102,18 +90,7 @@ setup(
         "xxhash==3.8.0",
         "threadpoolctl==3.6.0",
     ],
-    # install_requires=[
-    #     "torch==2.7.1",
-    #     "torch-geometric==2.7.0",
-    #     "scikit-learn==1.9.0",
-    #     "numpy==2.5.0",
-    #     "pandas==3.0.4",
-    #     "scipy==1.18.0",
-    #     "matplotlib==3.11.0",
-    #     "tqdm==4.68.3",
-    #     "networkx==3.6.1",
-    #     "pyyaml==6.0.3",
-    # ],
+
     extras_require={
         "lagrangian": [
             "pyg-lib",
