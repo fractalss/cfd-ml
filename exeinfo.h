@@ -6,6 +6,7 @@
 struct ExeInfo
 {
     const char* fullName = "CPFD Rom Tool";
+    bool inferOnly {false};
 
     void printVersionInformation();
     void printLicenseInformation(const LicenseManager &lm);

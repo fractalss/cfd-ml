@@ -31,7 +31,8 @@ bool ExeInfo::setOptions(int argc, char* argv[], const LicenseManager& lm)
         ("help,h", "Display help information") //
         ("config", po::value<std::string>()->implicit_value(""), "Configuration input file") //
         ("version,v", po::value<std::string>()->implicit_value(""), "Display version information") //
-        ("licensing", "Display license information")
+        ("licensing", "Display license information") //
+        ("infer-only", "Run in inference only mode") //
         ;
 
     po::options_description devOptions(std::string(fullName) + " developement options");
@@ -91,14 +92,19 @@ bool ExeInfo::setOptions(int argc, char* argv[], const LicenseManager& lm)
         if (vm.count("config"))
         {
             std::string versionArg = vm["config"].as<std::string>();
-            if (!versionArg.empty()) {
-                //pass this on to python for processing
-                return true;
+            if (versionArg.empty()) {
+              std::cout << "An input file must be specified with the --config option" << std::endl;
+              return false;
             }
-            std::cout << "An input file must be specified with the --config option" << std::endl;
-            return false;
+            //pass this on to python for processing
+        }
+        if (vm.count("infer-only"))
+        {
+            inferOnly = true;
+            //pass this on to python for processing
         }
         po::notify(vm);
+        return true; // all was ok.
     }
     catch (std::exception& e)
     {
