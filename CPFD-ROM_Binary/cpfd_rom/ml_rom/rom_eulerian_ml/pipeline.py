@@ -323,6 +323,364 @@ def _write_inference_metadata(
         f.write(f"n_snapshots_written = {int(n_snapshots)}\n")
 
 
+
+# ------------------------------
+# Local helpers  lightweight Eulerian inference artifacts
+# ------------------------------
+
+def _model_dir_from_cfg(cfg) -> Path:
+    """Return the directory used to store Eulerian model/inference artifacts."""
+    raw = Path(getattr(cfg, "model_path_eulerian", "model_files"))
+    return raw.parent if raw.suffix else raw
+
+
+def _eulerian_artifact_path(cfg) -> Path:
+    """Path to the cached bundle needed for lightweight --infer-only."""
+    return _model_dir_from_cfg(cfg) / "eulerian_inference_artifacts.pt"
+
+
+def _time_cfg_to_dict(time_cfg) -> dict:
+    """Serialize the time feature configuration without depending on its class type."""
+    if hasattr(time_cfg, "__dict__"):
+        return dict(time_cfg.__dict__)
+    return {
+        "add_time": bool(getattr(time_cfg, "add_time", False)),
+        "time_mode": getattr(time_cfg, "time_mode", "none"),
+        "fourier_m": int(getattr(time_cfg, "fourier_m", 0)),
+        "time_gain": float(getattr(time_cfg, "time_gain", 1.0)),
+        "t_feat_dim": int(getattr(time_cfg, "t_feat_dim", 0)),
+        "conv_type": str(getattr(time_cfg, "conv_type", getattr(time_cfg, "conv", "sage"))).lower(),
+        "gat_heads": int(getattr(time_cfg, "gat_heads", 4)),
+        "attn_drop": float(getattr(time_cfg, "attn_drop", 0.1)),
+    }
+
+
+def _save_eulerian_inference_artifacts(
+    *,
+    cfg,
+    ref_rev,
+    ref_graph_dir,
+    nodes_df,
+    edge_index,
+    X_node,
+    colmap_canon,
+    time_cfg,
+    times_train,
+    p_mu,
+    p_std,
+    res_mu,
+    res_std,
+    y_lo: float,
+    y_hi: float,
+    pmin: float,
+    pmax: float,
+    baseline_mode: str,
+    use_residual: bool,
+    use_baseline_as_feature: bool,
+    baseline_model,
+    n_nodes: int,
+    n_edges: int,
+) -> None:
+    """Persist the minimum cached state needed by lightweight --infer-only.
+
+    This avoids reading raw cells_*.txt files, rebuilding graph artifacts, and
+    regenerating snapshot target arrays when only new operating-parameter
+    inference is requested.
+    """
+    artifact_path = _eulerian_artifact_path(cfg)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "schema_version": 1,
+        "field_variable": getattr(cfg, "field_variable", None),
+        "type_of_field": getattr(cfg, "type_of_field", None),
+        "rom_type": getattr(cfg, "rom_type", None),
+        "ref_rev": str(ref_rev),
+        "ref_graph_dir": str(ref_graph_dir),
+        "nodes_df": nodes_df,
+        "edge_index": edge_index.cpu() if hasattr(edge_index, "cpu") else torch.as_tensor(edge_index, dtype=torch.long),
+        "X_node": X_node.cpu() if hasattr(X_node, "cpu") else torch.as_tensor(X_node, dtype=torch.float32),
+        "colmap_canon": np.asarray(colmap_canon),
+        "time_cfg": _time_cfg_to_dict(time_cfg),
+        "times_train": np.asarray(times_train, dtype=np.float32) if times_train is not None else None,
+        "p_mu": np.asarray(p_mu, dtype=np.float32),
+        "p_std": np.asarray(p_std, dtype=np.float32),
+        "res_mu": np.asarray(res_mu, dtype=np.float32),
+        "res_std": np.asarray(res_std, dtype=np.float32),
+        "y_lo": float(y_lo),
+        "y_hi": float(y_hi),
+        "pmin": float(pmin),
+        "pmax": float(pmax),
+        "baseline_mode": str(baseline_mode),
+        "use_residual": bool(use_residual),
+        "use_baseline_as_feature": bool(use_baseline_as_feature),
+        "baseline_model": baseline_model,
+        "n_nodes": int(n_nodes),
+        "n_edges": int(n_edges),
+        "model_config": {
+            "conv_type": str(getattr(cfg, "conv_type", "sage")).lower(),
+            "hidden": int(getattr(cfg, "hidden", 256)),
+            "dropout": float(getattr(cfg, "dropout", 0.0)),
+            "gat_heads": int(getattr(cfg, "gat_heads", 4)),
+            "attn_dropout": float(getattr(cfg, "attn_dropout", 0.1)),
+            "early_stopping": bool(getattr(cfg, "early_stopping", True)),
+            "es_patience": int(getattr(cfg, "es_patience", 10)),
+            "es_min_delta": float(getattr(cfg, "es_min_delta", 0.0)),
+            "es_restore_best": bool(getattr(cfg, "es_restore_best", True)),
+        },
+    }
+
+    try:
+        torch.save(payload, artifact_path)
+        print(f"[ARTIFACT] wrote Eulerian inference artifacts -> {artifact_path}")
+    except Exception as e:
+        # Do not make a successful training run fail just because artifact caching
+        # could not serialize an optional helper object such as a custom baseline.
+        print(f"[ARTIFACT] WARNING: failed to write Eulerian inference artifacts: {e}")
+
+
+def _load_eulerian_inference_artifacts(cfg) -> dict:
+    artifact_path = _eulerian_artifact_path(cfg)
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            f"Missing Eulerian inference artifact: {artifact_path}. "
+            "Run a normal training/full pipeline once before using --infer-only."
+        )
+
+    print(f"[ARTIFACT] loading Eulerian inference artifacts <- {artifact_path}")
+    return torch.load(artifact_path, map_location="cpu", weights_only=False)
+
+
+def _run_eulerian_inference_outputs(
+    *,
+    cfg,
+    log_time,
+    model,
+    model_path_pt: Path,
+    ref_rev: str,
+    edge_index,
+    X_node,
+    nodes_df,
+    colmap_canon,
+    time_cfg,
+    times_train,
+    user_parameters: list[float],
+    p_mu,
+    p_std,
+    res_mu,
+    res_std,
+    y_lo: float,
+    y_hi: float,
+    pmin: float,
+    pmax: float,
+    baseline_mode: str,
+    use_residual: bool,
+    use_baseline_as_feature: bool,
+    baseline_model,
+    n_nodes: int,
+    n_edges: int,
+):
+    """Shared inference writer used by full mode and lightweight --infer-only."""
+    with log_time("Inference at user_parameter(s): parameter-specific ROM outputs"):
+        out_root = Path(cfg.output_dir) / "graph"
+        ref_dir = out_root / ref_rev
+        targets = list_targets(ref_dir)
+        times = np.array([t for t, _ in targets], dtype=float)
+
+        print(f"[INFER] predicting {len(times)} snapshots for user_parameters={user_parameters}")
+
+        # Time statistics must match the training time feature construction.
+        if time_cfg.add_time and times_train is not None and len(times_train) > 0:
+            t_mu = float(np.mean(times_train))
+            t_sigma = float(np.std(times_train)) if np.std(times_train) > 0 else 1.0
+            t_min = float(np.min(times_train))
+            t_max_train = float(np.max(times_train))
+            t_max = t_max_train if t_max_train > t_min else (t_min + 1.0)
+        else:
+            t_mu = None
+            t_sigma = None
+            t_min, t_max = 0.0, 1.0
+
+        ei_torch = torch.as_tensor(edge_index, dtype=torch.long)
+        X_node_t = X_node.clone() if hasattr(X_node, "clone") else torch.tensor(X_node, dtype=torch.float32)
+
+        # FILE-order node dataframe is independent of operating parameter.
+        nodes_df_file = to_file_order(nodes_df, colmap_canon, dataframe=True)
+
+        print(f"[CLIP] global [{y_lo:.6e}, {y_hi:.6e}]")
+
+        for user_param_i in user_parameters:
+            print(f"[INFER] user_parameter={user_param_i:.6f}")
+
+            params_row = ((np.array([user_param_i], dtype=np.float32) - p_mu) / p_std).astype(np.float32)
+
+            # Optional baseline feature channel at inference.
+            baseline_feats = None
+            if use_baseline_as_feature and (baseline_model is not None):
+                baseline_feats = baseline_model.predict_user(times, user_param_i)  # (S, N)
+
+            preds_list = []
+
+            for s, t in enumerate(times):
+                b_feat_row = baseline_feats[s] if baseline_feats is not None else None
+
+                y = predict_gcn(
+                    model,
+                    edge_index=ei_torch,
+                    X_node=X_node_t,
+                    params_row=params_row,
+                    add_time=time_cfg.add_time,
+                    time_val=(float(t) if time_cfg.add_time else None),
+                    time_mode=time_cfg.time_mode,
+                    t_min=t_min,
+                    t_max=t_max,
+                    t_mu=t_mu,
+                    t_sigma=t_sigma,
+                    fourier_m=time_cfg.fourier_m,
+                    time_gain=time_cfg.time_gain,
+                    baseline_chan=b_feat_row,
+                )
+
+                preds_list.append(y.detach().cpu().numpy())
+
+            preds = np.stack(preds_list, axis=0)  # (S, N)
+
+            # De-normalize. If residual mode is enabled, this is the predicted residual field.
+            preds = preds * res_std + res_mu
+
+            # If residual mode, add the user-parameter-specific baseline field back.
+            if use_residual and (baseline_model is not None):
+                base_user = baseline_model.predict_user(times, user_param_i)
+                preds = preds + base_user
+
+            # Clip to training target range.
+            np.clip(preds, y_lo, y_hi, out=preds)
+
+            # NODE canonical order -> FILE order.
+            preds_file = to_file_order(preds, colmap_canon)
+
+            # Parameter-specific ROM directory for transient ML / baseline+ output.
+            out_dir = _rom_param_output_dir(cfg, user_param_i)
+            print(f"[WRITE] user_parameter={user_param_i:.6f} -> {out_dir}")
+
+            _write_rom_only(
+                preds_file,
+                times,
+                nodes_df_file,
+                getattr(cfg, "field_variable", None),
+                out_dir,
+            )
+
+            _write_inference_metadata(
+                out_dir=out_dir,
+                user_param=user_param_i,
+                cfg=cfg,
+                baseline_mode=baseline_mode,
+                use_residual=use_residual,
+                use_baseline_as_feature=use_baseline_as_feature,
+                time_cfg=time_cfg,
+                model_path_pt=Path(model_path_pt),
+                train_param_min=pmin,
+                train_param_max=pmax,
+                y_min=y_lo,
+                y_max=y_hi,
+                n_nodes=n_nodes,
+                n_edges=n_edges,
+                n_snapshots=len(times),
+            )
+
+
+def run_ml_rom_infer_only_pipeline(cfg, log_time, model_path_pt: Path):
+    """Lightweight Eulerian inference path.
+
+    This path avoids graph rebuild, raw snapshot target generation, dataset
+    construction, normalization fitting, and model training. It requires that a
+    normal/full run has already written the checkpoint and inference artifact.
+    """
+    print("[INFER-ONLY] Lightweight Eulerian inference mode enabled")
+    print("[INFER-ONLY] Skipping graph rebuild, snapshot target generation, dataset construction, and training")
+
+    from types import SimpleNamespace
+
+    with log_time("Loading Eulerian inference artifacts"):
+        art = _load_eulerian_inference_artifacts(cfg)
+
+    user_parameters = _resolve_user_parameters(cfg)
+    time_cfg = SimpleNamespace(**art["time_cfg"])
+
+    edge_index = art["edge_index"]
+    X_node = art["X_node"]
+    nodes_df = art["nodes_df"]
+    colmap_canon = art["colmap_canon"]
+
+    p_mu = art["p_mu"]
+    p_std = art["p_std"]
+    res_mu = art["res_mu"]
+    res_std = art["res_std"]
+
+    use_baseline_as_feature = bool(art["use_baseline_as_feature"])
+    use_residual = bool(art["use_residual"])
+    baseline_model = art.get("baseline_model", None)
+
+    p_dim = int(np.asarray(p_mu).reshape(-1).shape[0])
+    in_dim = int(X_node.shape[1]) + p_dim + (int(time_cfg.t_feat_dim) if bool(time_cfg.add_time) else 0)
+    if use_baseline_as_feature:
+        in_dim += 1
+
+    print(
+        f"[INFER-ONLY] in_dim={in_dim}  X={X_node.shape[1]}  P={p_dim}  "
+        f"t={(int(time_cfg.t_feat_dim) if bool(time_cfg.add_time) else 0)}  "
+        f"baseline={'yes' if use_baseline_as_feature else 'no'}"
+    )
+
+    mc = art.get("model_config", {})
+    model = load_or_build_model(
+        model_path_pt=model_path_pt,
+        in_dim=in_dim,
+        conv_type=str(mc.get("conv_type", getattr(cfg, "conv_type", "sage"))).lower(),
+        hidden=int(mc.get("hidden", getattr(cfg, "hidden", 256))),
+        dropout=float(mc.get("dropout", getattr(cfg, "dropout", 0.0))),
+        gat_heads=int(mc.get("gat_heads", getattr(cfg, "gat_heads", 4))),
+        attn_drop=float(mc.get("attn_dropout", getattr(cfg, "attn_dropout", 0.1))),
+        early_stopping=bool(mc.get("early_stopping", getattr(cfg, "early_stopping", True))),
+        es_patience=int(mc.get("es_patience", getattr(cfg, "es_patience", 10))),
+        es_min_delta=float(mc.get("es_min_delta", getattr(cfg, "es_min_delta", 0.0))),
+        es_restore_best=bool(mc.get("es_restore_best", getattr(cfg, "es_restore_best", True))),
+        skip_training=True,
+    )
+
+    _run_eulerian_inference_outputs(
+        cfg=cfg,
+        log_time=log_time,
+        model=model,
+        model_path_pt=Path(model_path_pt),
+        ref_rev=art["ref_rev"],
+        edge_index=edge_index,
+        X_node=X_node,
+        nodes_df=nodes_df,
+        colmap_canon=colmap_canon,
+        time_cfg=time_cfg,
+        times_train=art["times_train"],
+        user_parameters=user_parameters,
+        p_mu=p_mu,
+        p_std=p_std,
+        res_mu=res_mu,
+        res_std=res_std,
+        y_lo=float(art["y_lo"]),
+        y_hi=float(art["y_hi"]),
+        pmin=float(art["pmin"]),
+        pmax=float(art["pmax"]),
+        baseline_mode=str(art["baseline_mode"]),
+        use_residual=use_residual,
+        use_baseline_as_feature=use_baseline_as_feature,
+        baseline_model=baseline_model,
+        n_nodes=int(art["n_nodes"]),
+        n_edges=int(art["n_edges"]),
+    )
+
+    return None, None
+
+
 # ------------------------------
 # Main pipeline
 # ------------------------------
@@ -342,6 +700,14 @@ def run_ml_rom_pipeline(cfg, log_time):
     setup_output_dir(cfg)
     setup_model_paths(cfg)
     model_path_pt = torch_model_path(cfg.model_path_eulerian)
+
+    # --- Lightweight inference-only path. Must occur before raw-data preparation. ---
+    if bool(getattr(cfg, "infer_only", False)):
+        return run_ml_rom_infer_only_pipeline(
+            cfg=cfg,
+            log_time=log_time,
+            model_path_pt=model_path_pt,
+        )
 
     # --- Build canonical graph + datasets. First rev defines graph. ---
     with log_time("Preparing graph & datasets from rev_dirs"):
@@ -732,116 +1098,64 @@ def run_ml_rom_pipeline(cfg, log_time):
 
             save_state_dict(model, model_path_pt, hist)
 
+    # --- Save lightweight inference artifacts for future --infer-only runs. ---
+    y_lo = float(np.min(Y_train))
+    y_hi = float(np.max(Y_train))
+
+    _save_eulerian_inference_artifacts(
+        cfg=cfg,
+        ref_rev=ref_rev,
+        ref_graph_dir=ref_graph_dir,
+        nodes_df=nodes_df,
+        edge_index=edge_index,
+        X_node=X_node,
+        colmap_canon=colmap_canon,
+        time_cfg=time_cfg,
+        times_train=times_train,
+        p_mu=p_mu,
+        p_std=p_std,
+        res_mu=res_mu,
+        res_std=res_std,
+        y_lo=y_lo,
+        y_hi=y_hi,
+        pmin=pmin,
+        pmax=pmax,
+        baseline_mode=baseline_mode,
+        use_residual=use_residual,
+        use_baseline_as_feature=use_baseline_as_feature,
+        baseline_model=baseline_model,
+        n_nodes=N,
+        n_edges=E,
+    )
+
     # --- Inference at one or many user parameters. ---
-    with log_time("Inference at user_parameter(s): parameter-specific ROM outputs"):
-        out_root = Path(cfg.output_dir) / "graph"
-        ref_dir = out_root / ref_rev
-        targets = list_targets(ref_dir)
-        times = np.array([t for t, _ in targets], dtype=float)
-
-        print(f"[INFER] predicting {len(times)} snapshots for user_parameters={user_parameters}")
-
-        # Time statistics must match the training time feature construction.
-        if time_cfg.add_time and times_train is not None and len(times_train) > 0:
-            t_mu = float(np.mean(times_train))
-            t_sigma = float(np.std(times_train)) if np.std(times_train) > 0 else 1.0
-            t_min = float(np.min(times_train))
-            t_max_train = float(np.max(times_train))
-            t_max = t_max_train if t_max_train > t_min else (t_min + 1.0)
-        else:
-            t_mu = None
-            t_sigma = None
-            t_min, t_max = 0.0, 1.0
-
-        ei_torch = torch.as_tensor(edge_index, dtype=torch.long)
-        X_node_t = X_node.clone() if hasattr(X_node, "clone") else torch.tensor(X_node, dtype=torch.float32)
-
-        # FILE-order node dataframe is independent of operating parameter.
-        nodes_df_file = to_file_order(nodes_df, colmap_canon, dataframe=True)
-
-        y_lo = float(np.min(Y_train))
-        y_hi = float(np.max(Y_train))
-        print(f"[CLIP] global [{y_lo:.6e}, {y_hi:.6e}]")
-
-        for user_param_i in user_parameters:
-            print(f"[INFER] user_parameter={user_param_i:.6f}")
-
-            params_row = ((np.array([user_param_i], dtype=np.float32) - p_mu) / p_std).astype(np.float32)
-
-            # Optional baseline feature channel at inference.
-            # This is required for baseline+ transient ROMs trained with baseline-as-feature.
-            baseline_feats = None
-            if use_baseline_as_feature and (baseline_model is not None):
-                baseline_feats = baseline_model.predict_user(times, user_param_i)  # (S, N)
-
-            preds_list = []
-
-            for s, t in enumerate(times):
-                b_feat_row = baseline_feats[s] if baseline_feats is not None else None
-
-                y = predict_gcn(
-                    model,
-                    edge_index=ei_torch,
-                    X_node=X_node_t,
-                    params_row=params_row,
-                    add_time=time_cfg.add_time,
-                    time_val=(float(t) if time_cfg.add_time else None),
-                    time_mode=time_cfg.time_mode,
-                    t_min=t_min,
-                    t_max=t_max,
-                    t_mu=t_mu,
-                    t_sigma=t_sigma,
-                    fourier_m=time_cfg.fourier_m,
-                    time_gain=time_cfg.time_gain,
-                    baseline_chan=b_feat_row,
-                )
-
-                preds_list.append(y.detach().cpu().numpy())
-
-            preds = np.stack(preds_list, axis=0)  # (S, N)
-
-            # De-normalize. If residual mode is enabled, this is the predicted residual field.
-            preds = preds * res_std + res_mu
-
-            # If residual mode, add the user-parameter-specific baseline field back.
-            if use_residual and (baseline_model is not None):
-                base_user = baseline_model.predict_user(times, user_param_i)
-                preds = preds + base_user
-
-            # Clip to training target range.
-            np.clip(preds, y_lo, y_hi, out=preds)
-
-            # NODE canonical order -> FILE order.
-            preds_file = to_file_order(preds, colmap_canon)
-
-            # Parameter-specific ROM directory for transient ML / baseline+ output.
-            out_dir = _rom_param_output_dir(cfg, user_param_i)
-            print(f"[WRITE] user_parameter={user_param_i:.6f} -> {out_dir}")
-
-            _write_rom_only(
-                preds_file,
-                times,
-                nodes_df_file,
-                getattr(cfg, "field_variable", None),
-                out_dir,
-            )
-
-            _write_inference_metadata(
-                out_dir=out_dir,
-                user_param=user_param_i,
-                cfg=cfg,
-                baseline_mode=baseline_mode,
-                use_residual=use_residual,
-                use_baseline_as_feature=use_baseline_as_feature,
-                time_cfg=time_cfg,
-                model_path_pt=Path(model_path_pt),
-                train_param_min=pmin,
-                train_param_max=pmax,
-                y_min=y_lo,
-                y_max=y_hi,
-                n_nodes=N,
-                n_edges=E,
-                n_snapshots=len(times),
-            )
+    _run_eulerian_inference_outputs(
+        cfg=cfg,
+        log_time=log_time,
+        model=model,
+        model_path_pt=Path(model_path_pt),
+        ref_rev=ref_rev,
+        edge_index=edge_index,
+        X_node=X_node,
+        nodes_df=nodes_df,
+        colmap_canon=colmap_canon,
+        time_cfg=time_cfg,
+        times_train=times_train,
+        user_parameters=user_parameters,
+        p_mu=p_mu,
+        p_std=p_std,
+        res_mu=res_mu,
+        res_std=res_std,
+        y_lo=y_lo,
+        y_hi=y_hi,
+        pmin=pmin,
+        pmax=pmax,
+        baseline_mode=baseline_mode,
+        use_residual=use_residual,
+        use_baseline_as_feature=use_baseline_as_feature,
+        baseline_model=baseline_model,
+        n_nodes=N,
+        n_edges=E,
+    )
 
     return None, None

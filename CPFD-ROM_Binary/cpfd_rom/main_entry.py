@@ -74,18 +74,17 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
 
     try:
         cfg = load_config(config_path)
+        # ------------------------------------------------------------
+        # CLI/YAML-level mode override
+        # ------------------------------------------------------------
+        effective_infer_only = bool(infer_only or getattr(cfg, "infer_only", False))
 
-        # ------------------------------------------------------------
-        # CLI-level mode override
-        # ------------------------------------------------------------
-        if infer_only:
-            setattr(cfg, "skip_training", True)
+        if effective_infer_only:
             setattr(cfg, "infer_only", True)
-            # model_path = getattr(cfg, "model_path", None)
-            # if not model_path:
-            #     raise ValueError(
-            #         "--infer-only requires model_path to be defined in the YAML config."
-            #     )
+            setattr(cfg, "skip_training", True)
+            setattr(cfg, "rebuild_graph", False)
+            setattr(cfg, "rebuild_targets", False)
+            setattr(cfg, "use_cached_artifacts", True)
         else:
             setattr(cfg, "infer_only", False)
 
@@ -101,7 +100,6 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
                 d if os.path.isabs(d) else os.path.join(cfg.base_data_dir, d)
                 for d in cfg.rev_dirs
             ]
-
         print(
             "[MAIN] Effective:",
             "rom_type=", getattr(cfg, "rom_type", None),
@@ -110,6 +108,9 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
             "seed=", seed,
             "infer_only=", getattr(cfg, "infer_only", False),
             "skip_training=", getattr(cfg, "skip_training", False),
+            "rebuild_graph=", getattr(cfg, "rebuild_graph", False),
+            "rebuild_targets=", getattr(cfg, "rebuild_targets", False),
+            "use_cached_artifacts=", getattr(cfg, "use_cached_artifacts", False),
         )
 
         rom_type = str(getattr(cfg, "rom_type", "")).strip()
