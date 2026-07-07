@@ -5,9 +5,6 @@
 #include <iostream>
 #include "license-manager/license-manager/licensemanager.h"
 
-// todo, require ROM license
-License::Type licenseType = License::Type::CpfdRomTraining;
-
 int main(int argc, char* argv[]) {
 
 #ifdef __linux__
@@ -25,6 +22,8 @@ int main(int argc, char* argv[]) {
   exeInfo.printVersionInformation();
   std::cout << std::endl;
 
+  License::Type licenseType = License::Type::CpfdRomTraining;
+  if(exeInfo.inferOnly) {licenseType = License::Type::CpfdRomInference;}
   licenseManager.checkoutLicenses({ { licenseType, 1 } });
   std::cout << std::endl;
 

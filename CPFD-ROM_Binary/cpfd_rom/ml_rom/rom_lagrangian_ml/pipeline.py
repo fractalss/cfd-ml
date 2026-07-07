@@ -322,6 +322,296 @@ def _infer_with_fourier_time(
     return preds_list, times_out
 
 
+
+# ------------------------------
+# Lightweight inference artifacts
+# ------------------------------
+
+def _lagrangian_artifact_path(config) -> str:
+    """Return the first-pass Lagrangian inference artifact path."""
+    return os.path.join(config.model_dir, "lagrangian_inference_artifacts.pt")
+
+
+def _save_lagrangian_inference_artifacts(
+    *,
+    config,
+    feature_stats,
+    t_min,
+    t_max,
+    param_dim,
+    latent_reg_in_dim,
+    latent_dim,
+    hidden_dim,
+    num_gnn_layers,
+    num_time_bands,
+    max_time_freq,
+    include_raw_time,
+    use_bn,
+    graph_radius,
+    sample_ratio,
+    max_num_neighbors,
+    batch_size,
+    latent_reg_hidden_dims,
+):
+    """Save the minimum metadata needed for first-pass lightweight inference.
+
+    This intentionally does not cache template/scaffold graphs yet. The first pass skips
+    training-graph loading, dataset construction, AE latent extraction, and model training,
+    while still extracting nearest-rev scaffold graphs during inference.
+    """
+    artifact_path = _lagrangian_artifact_path(config)
+    os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+
+    payload = {
+        "feature_stats": feature_stats,
+        "t_min": float(t_min),
+        "t_max": float(t_max),
+        "param_dim": int(param_dim),
+        "latent_reg_in_dim": int(latent_reg_in_dim),
+        "latent_dim": int(latent_dim),
+        "hidden_dim": int(hidden_dim),
+        "num_gnn_layers": int(num_gnn_layers),
+        "num_time_bands": int(num_time_bands),
+        "max_time_freq": float(max_time_freq),
+        "include_raw_time": bool(include_raw_time),
+        "use_bn": bool(use_bn),
+        "graph_radius": float(graph_radius),
+        "sample_ratio": float(sample_ratio),
+        "max_num_neighbors": int(max_num_neighbors),
+        "batch_size": int(batch_size),
+        "latent_reg_hidden_dims": list(latent_reg_hidden_dims),
+        "field_variable": getattr(config, "field_variable", None),
+        "type_of_field": getattr(config, "type_of_field", None),
+        "rom_type": getattr(config, "rom_type", None),
+    }
+
+    torch.save(payload, artifact_path)
+    print(f"[ARTIFACT] wrote Lagrangian inference artifacts -> {artifact_path}")
+
+
+def _load_lagrangian_inference_artifacts(config) -> dict:
+    """Load first-pass Lagrangian inference artifact bundle."""
+    artifact_path = _lagrangian_artifact_path(config)
+    if not os.path.exists(artifact_path):
+        raise FileNotFoundError(
+            f"Missing Lagrangian inference artifact: {artifact_path}. "
+            "Run a normal Lagrangian pipeline once before --infer-only."
+        )
+
+    print(f"[ARTIFACT] loading Lagrangian inference artifacts <- {artifact_path}")
+    return torch.load(artifact_path, map_location="cpu", weights_only=False)
+
+
+def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent_reg_path: str):
+    """First-pass lightweight Lagrangian inference path.
+
+    This branch skips raw training graph loading, feature-stat computation from training
+    graphs, dataset construction, AE latent extraction, and both training loops. It still
+    extracts nearest-rev scaffold/template graphs because the current decoder path needs
+    a template particle cloud for each output time.
+    """
+    print("[INFER-ONLY] Lightweight Lagrangian inference mode enabled")
+    print("[INFER-ONLY] Skipping raw training graph loading, dataset construction, AE latent extraction, and training")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"[INFER-ONLY] Missing AE model checkpoint: {model_path}")
+    if not os.path.exists(latent_reg_path):
+        raise FileNotFoundError(f"[INFER-ONLY] Missing latent regressor checkpoint: {latent_reg_path}")
+
+    with log_time("Loading Lagrangian inference artifacts"):
+        art = _load_lagrangian_inference_artifacts(config)
+
+    feature_stats = art["feature_stats"]
+    t_min = float(art["t_min"])
+    t_max = float(art["t_max"])
+
+    param_dim = int(art["param_dim"])
+    latent_reg_in_dim = int(art["latent_reg_in_dim"])
+    latent_dim = int(art["latent_dim"])
+    hidden_dim = int(art["hidden_dim"])
+    num_gnn_layers = int(art["num_gnn_layers"])
+    num_time_bands = int(art["num_time_bands"])
+    max_time_freq = float(art["max_time_freq"])
+    include_raw_time = bool(art["include_raw_time"])
+    use_bn = bool(art["use_bn"])
+
+    graph_radius = float(art["graph_radius"])
+    sample_ratio = float(art["sample_ratio"])
+    max_num_neighbors = int(art["max_num_neighbors"])
+    latent_reg_hidden_dims = art["latent_reg_hidden_dims"]
+
+    inference_debug = bool(getattr(config, "inference_debug", True))
+
+    if not getattr(config, "rev_dirs", None):
+        raise ValueError("[Lagrangian/InferOnly] config.rev_dirs must be provided.")
+    if not hasattr(config, "base_data_dir"):
+        raise ValueError("[Lagrangian/InferOnly] config.base_data_dir must be provided.")
+    if getattr(config, "param_mapping", None) is None:
+        raise ValueError("[Lagrangian/InferOnly] config.param_mapping must be provided.")
+    if getattr(config, "field_variable", None) is None:
+        raise ValueError("[Lagrangian/InferOnly] config.field_variable must be provided.")
+    if not hasattr(config, "user_parameter"):
+        raise ValueError("[Lagrangian/InferOnly] config.user_parameter must be set.")
+
+    user_param_requests = _as_single_parameter_request_list(config.user_parameter)
+    print("[INFO] Requested Lagrangian scalar user_parameter values:")
+    for pvec in user_param_requests:
+        print(f"  {float(pvec[0]):.6f}")
+
+    model = PointNetGNNAutoencoder(
+        in_dim=4,
+        param_dim=param_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        out_dim=4,
+        num_gnn_layers=num_gnn_layers,
+        num_time_bands=num_time_bands,
+        max_time_freq=max_time_freq,
+        include_raw_time=include_raw_time,
+        use_bn=use_bn,
+    ).to(device)
+
+    with log_time("Loading pretrained AE model"):
+        print(f"[INFO] Loading pretrained AE model from {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    latent_reg_model = LatentRegressorMLP(
+        in_dim=latent_reg_in_dim,
+        latent_dim=latent_dim,
+        hidden_dims=latent_reg_hidden_dims,
+    ).to(device)
+
+    with log_time("Loading pretrained latent regressor"):
+        print(f"[INFO] Loading pretrained latent regressor from {latent_reg_path}")
+        latent_reg_model.load_state_dict(torch.load(latent_reg_path, map_location=device))
+    latent_reg_model.eval()
+
+    reference_time_rev = getattr(config, "reference_time_rev", config.rev_dirs[0])
+
+    ref_times = load_lagrangian_snapshot_times(
+        rev_dir=reference_time_rev,
+        base_data_dir=config.base_data_dir,
+        sample_ratio=sample_ratio,
+        field_variable=config.field_variable,
+    )
+    ref_times = _validate_reference_times(ref_times)
+
+    print(
+        f"[TimingRef] Using reference_time_rev='{reference_time_rev}' "
+        f"with {len(ref_times)} sorted reference times"
+    )
+
+    lagrangian_root_out = os.path.join(config.output_dir, "Lagrangian_ROM")
+    os.makedirs(lagrangian_root_out, exist_ok=True)
+
+    for user_param_vec in user_param_requests:
+        param_dir_name = _format_rom_param_dir(user_param_vec)
+        out_dir = os.path.join(lagrangian_root_out, param_dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        print("=" * 80)
+        print(
+            f"[INFO] Running Lagrangian ROM inference for "
+            f"user_parameter = {float(user_param_vec[0]):.6f}"
+        )
+        print(f"[INFO] Output directory: {out_dir}")
+
+        with log_time(f"Extracting nearest-rev template graphs for {param_dir_name}"):
+            template_graphs = extract_scaffold_graphs(
+                rev_dirs=config.rev_dirs,
+                base_data_dir=config.base_data_dir,
+                param_mapping=config.param_mapping,
+                param_train_array=None,
+                user_param_array=user_param_vec,
+                field_variable=config.field_variable,
+                radius=graph_radius,
+                sample_ratio=sample_ratio,
+                feature_stats=feature_stats,
+                max_num_neighbors=max_num_neighbors,
+                verbose_timing=False,
+            )
+
+        template_graphs = sort_graphs_by_time(template_graphs)
+        g0 = get_initial_template_graph(template_graphs)
+
+        print("[TemplateInit] Nearest-rev template initialization confirmed")
+        print(f"  user_parameter          : {float(user_param_vec[0]):.6f}")
+        print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
+        print(f"  first_template_time     : {float(g0.time.item()):.6f}")
+        print(f"  num_template_graphs     : {len(template_graphs)}")
+
+        if len(template_graphs) != len(ref_times):
+            raise ValueError(
+                f"[Lagrangian/InferOnly] template graphs ({len(template_graphs)}) and "
+                f"reference times ({len(ref_times)}) have different lengths "
+                f"for user_parameter={float(user_param_vec[0]):.6f}."
+            )
+
+        matched_graphs = list(template_graphs)
+        matched_times = [float(t) for t in ref_times]
+
+        _print_template_alignment_summary(matched_graphs, matched_times)
+
+        del template_graphs
+        gc.collect()
+
+        print(
+            f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
+            f"to {len(matched_times)} reference times"
+        )
+
+        with log_time(f"Running Lagrangian ROM inference for {param_dir_name}"):
+            preds, times = _infer_with_fourier_time(
+                user_param=user_param_vec,
+                model=model,
+                latent_regressor=latent_reg_model,
+                template_graphs=matched_graphs,
+                feature_stats=feature_stats,
+                device=device,
+                batch_size=1,
+                override_times=matched_times,
+                t_min=t_min,
+                t_max=t_max,
+                debug=inference_debug,
+            )
+
+        write_lagrangian_rom_only(
+            preds=preds,
+            times=times,
+            field_variable=config.field_variable,
+            out_dir=out_dir,
+            time_mode="raw",
+        )
+
+        print(
+            f"[INFO] ROM inference complete for user_parameter="
+            f"{float(user_param_vec[0]):.6f}. Output saved to: {out_dir}"
+        )
+
+        del matched_graphs
+        del preds
+        del times
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print(
+        f"[INFO] All Lagrangian ROM inference cases complete. "
+        f"Root output: {lagrangian_root_out}"
+    )
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return None, None
+
+
 def run_lagrangian_ml_pipeline(config, log_time):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
@@ -331,6 +621,14 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     model_path = os.path.join(config.model_dir, "pointnet_gnn_lagrangian.pt")
     latent_reg_path = os.path.join(config.model_dir, "latent_regressor.pt")
+
+    if bool(getattr(config, "infer_only", False)):
+        return run_lagrangian_infer_only_pipeline(
+            config=config,
+            log_time=log_time,
+            model_path=model_path,
+            latent_reg_path=latent_reg_path,
+        )
 
     batch_size = int(getattr(config, "batch_size", 2))
     latent_dim = int(getattr(config, "latent_dim", 32))
@@ -505,6 +803,27 @@ def run_lagrangian_ml_pipeline(config, log_time):
         print(f"[INFO] Saved latent regressor to {latent_reg_path}")
 
     latent_reg_model.eval()
+
+    _save_lagrangian_inference_artifacts(
+        config=config,
+        feature_stats=feature_stats,
+        t_min=t_min,
+        t_max=t_max,
+        param_dim=param_dim,
+        latent_reg_in_dim=latent_reg_in_dim,
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        num_gnn_layers=num_gnn_layers,
+        num_time_bands=num_time_bands,
+        max_time_freq=max_time_freq,
+        include_raw_time=include_raw_time,
+        use_bn=use_bn,
+        graph_radius=graph_radius,
+        sample_ratio=sample_ratio,
+        max_num_neighbors=max_num_neighbors,
+        batch_size=batch_size,
+        latent_reg_hidden_dims=latent_reg_hidden_dims,
+    )
 
     del train_set
     del train_loader_reg
