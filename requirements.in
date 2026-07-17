@@ -1,12 +1,16 @@
 # Core ML & Math
 ## we want cuda 12 to continue support for volta cards
--f https://data.pyg.org/whl/torch-2.8.0+cu126.html
---extra-index-url https://download.pytorch.org/whl/cu126
+-f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+--extra-index-url https://download.pytorch.org/whl/cu124
 
 
-torch==2.8.0
-torch-geometric
-pyg_lib>=0.6.0
+torch==2.6.0+cu124
+torch-geometric==2.7.0
+pyg-lib==0.5.0+pt26cu124
+torch-scatter==2.1.2+pt26cu124
+torch-sparse==0.6.18+pt26cu124
+torch-cluster==1.6.3+pt26cu124
+torch-spline-conv==1.2.2+pt26cu124
 scikit-learn
 numpy
 pandas
