@@ -399,7 +399,7 @@ endif()
 # python packages
 set(PKGS_TO_COPY yaml numpy pandas torch torch_geometric tqdm sklearn trimesh matplotlib typing_extensions torchgen pytz dateutil six sympy
                  pyarrow fastparquet certifi idna urllib3 requests markupsafe jinja2 psutil fsspec mpmath  xxhash  cusparselt scipy joblib narwhals
-                 threadpoolctl scikit_learn.libs pyg_lib)
+                 threadpoolctl scikit_learn.libs pyg_lib torch_cluster torch_scatter torch_sparse torch_spline_conv)
 
 foreach(PKG ${PKGS_TO_COPY})
     # Define paths for both possibilities
