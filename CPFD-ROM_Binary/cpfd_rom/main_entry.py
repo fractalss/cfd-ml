@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import time
 import random
+import time
 from contextlib import contextmanager
 
 import numpy as np
 import torch
 
 from cpfd_rom.util.config import load_config
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
 
 
 def set_seed(seed: int) -> None:
@@ -24,18 +30,17 @@ def set_seed(seed: int) -> None:
     """
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # Keep these False for performance unless you need strict reproducibility.
+    # Keep these False for performance unless strict reproducibility is needed.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-    print(f"[MAIN] Global seed set to {seed}")
+    logger.debug("Global seed set to %d", seed)
 
 
 @contextmanager
@@ -44,15 +49,16 @@ def log_time(task_name: str):
     try:
         yield
     finally:
-        end = time.time()
-        print(f"[Timing] {task_name} took {end - start:.2f} seconds")
+        elapsed = time.time() - start
+        logger.info("%s completed in %.2f seconds", task_name, elapsed)
 
 
-def clear_memory():
+def clear_memory() -> None:
     gc.collect()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
 
 def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
     """
@@ -66,18 +72,24 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
     infer_only:
         If True, skip model training and run inference using an existing model.
 
-    Return codes:
-      0 success
-      1 failure
+    Return codes
+    ------------
+    0:
+        Success.
+    1:
+        Failure.
     """
     clear_memory()
 
     try:
+        logger.info("Loading ROM configuration")
+
         cfg = load_config(config_path)
-        # ------------------------------------------------------------
+
         # CLI/YAML-level mode override
-        # ------------------------------------------------------------
-        effective_infer_only = bool(infer_only or getattr(cfg, "infer_only", False))
+        effective_infer_only = bool(
+            infer_only or getattr(cfg, "infer_only", False)
+        )
 
         if effective_infer_only:
             setattr(cfg, "infer_only", True)
@@ -88,52 +100,83 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
         else:
             setattr(cfg, "infer_only", False)
 
-        # ------------------------------------------------------------
-        # Global seed for reproducibility / UQ ensemble runs
-        # ------------------------------------------------------------
-        seed = int(getattr(cfg, "seed", getattr(cfg, "shuffle_seed", 42)))
+        # Global seed for reproducibility and UQ ensemble runs
+        seed = int(
+            getattr(cfg, "seed", getattr(cfg, "shuffle_seed", 42))
+        )
         set_seed(seed)
 
-        # Prepend base_data_dir to rev_dirs if relative
-        if getattr(cfg, "base_data_dir", None) and getattr(cfg, "rev_dirs", None):
+        # Prepend base_data_dir to relative revision directories
+        if getattr(cfg, "base_data_dir", None) and getattr(
+            cfg, "rev_dirs", None
+        ):
             cfg.rev_dirs = [
-                d if os.path.isabs(d) else os.path.join(cfg.base_data_dir, d)
-                for d in cfg.rev_dirs
+                directory
+                if os.path.isabs(directory)
+                else os.path.join(cfg.base_data_dir, directory)
+                for directory in cfg.rev_dirs
             ]
-        print(
-            "[MAIN] Effective:",
-            "rom_type=", getattr(cfg, "rom_type", None),
-            "type_of_field=", getattr(cfg, "type_of_field", None),
-            "field_variable=", getattr(cfg, "field_variable", None),
-            "seed=", seed,
-            "infer_only=", getattr(cfg, "infer_only", False),
-            "skip_training=", getattr(cfg, "skip_training", False),
-            "rebuild_graph=", getattr(cfg, "rebuild_graph", False),
-            "rebuild_targets=", getattr(cfg, "rebuild_targets", False),
-            "use_cached_artifacts=", getattr(cfg, "use_cached_artifacts", False),
-        )
 
         rom_type = str(getattr(cfg, "rom_type", "")).strip()
         field_type = str(getattr(cfg, "type_of_field", "")).strip()
 
+        detail(
+            logger,
+            (
+                "Configuration: rom_type=%s, field_type=%s, "
+                "field_variable=%s, infer_only=%s, skip_training=%s"
+            ),
+            rom_type,
+            field_type,
+            getattr(cfg, "field_variable", None),
+            getattr(cfg, "infer_only", False),
+            getattr(cfg, "skip_training", False),
+        )
+
+        logger.debug(
+            (
+                "Artifact settings: seed=%d, rebuild_graph=%s, "
+                "rebuild_targets=%s, use_cached_artifacts=%s"
+            ),
+            seed,
+            getattr(cfg, "rebuild_graph", False),
+            getattr(cfg, "rebuild_targets", False),
+            getattr(cfg, "use_cached_artifacts", False),
+        )
+
         if rom_type == "ML" and field_type == "Eulerian":
-            from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import run_ml_rom_pipeline
+            logger.info("Starting Eulerian ML ROM pipeline")
+
+            from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import (
+                run_ml_rom_pipeline,
+            )
+
             run_ml_rom_pipeline(cfg, log_time)
 
         elif rom_type == "ML" and field_type == "Lagrangian":
-            from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import run_lagrangian_ml_pipeline
+            logger.info("Starting Lagrangian ML ROM pipeline")
+
+            from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import (
+                run_lagrangian_ml_pipeline,
+            )
+
             run_lagrangian_ml_pipeline(cfg, log_time)
 
         else:
             raise ValueError(
-                f"Unsupported ROM type / field type: "
+                "Unsupported ROM type / field type: "
                 f"rom_type={rom_type}, type_of_field={field_type}"
             )
 
         clear_memory()
+        logger.info("ROM execution completed successfully")
         return 0
 
-    except Exception as e:
-        print(f"[ERROR] {e}")
+    except Exception as error:
+        logger.error(
+            "ROM execution failed: %s",
+            error,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
         clear_memory()
         return 1
