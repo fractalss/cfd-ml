@@ -43,3 +43,11 @@ def configure_logging(verbosity: int = 0, quiet: bool = False) -> None:
 def detail(logger: logging.Logger, message: str, *args, **kwargs) -> None:
     """Write a message visible with -v or -vv."""
     logger.log(DETAIL_LEVEL, message, *args, **kwargs)
+def progress_enabled() -> bool:
+    """Enable progress bars only under -v or -vv."""
+    return logging.getLogger().getEffectiveLevel() <= DETAIL_LEVEL
+
+
+def debug_enabled() -> bool:
+    """Return True when debug diagnostics are enabled with -vv."""
+    return logging.getLogger().isEnabledFor(logging.DEBUG)

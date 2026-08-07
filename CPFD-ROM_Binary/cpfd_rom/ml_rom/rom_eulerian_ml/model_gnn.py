@@ -1,6 +1,7 @@
 # Saurav Mitra
 # model_gnn.py  (XYZ(+time)+param[+baseline] -> field)
 from __future__ import annotations
+import logging
 import math
 import numpy as np
 from typing import Dict, Tuple, Optional, Union
@@ -10,6 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, SAGEConv, GATConv, GINConv
 from torch_geometric.utils import to_undirected
+
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
 
 TensorLike = Union[np.ndarray, torch.Tensor]
 
@@ -399,7 +405,17 @@ def train_gcn_model(
                 sample_weights = sample_weights[k:]
             if baseline_train is not None and baseline_train.shape[0] == S0:
                 baseline_train = baseline_train[k:]
-            print(f"[PRUNE] Ignored first {k}/{S0} (~{(100.0*k/max(1,S0)):.1f}%) training snapshots (ignore_head_frac={ignore_head_frac}).")
+            detail(
+                logger,
+                (
+                    "Ignored first %d/%d training snapshots (%.1f%%; "
+                    "ignore_head_frac=%s)"
+                ),
+                k,
+                S0,
+                100.0 * k / max(1, S0),
+                ignore_head_frac,
+            )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -483,8 +499,17 @@ def train_gcn_model(
         torch.manual_seed(int(shuffle_seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(shuffle_seed))
-    print(f"[DBG] TRAIN Y mean/std {Y_train.mean():.3e}/{Y_train.std():.3e} | "
-          f"VAL Y mean/std {Y_val.mean():.3e}/{Y_val.std():.3e}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            (
+                "Target statistics: train mean/std=%.3e/%.3e, "
+                "validation mean/std=%.3e/%.3e"
+            ),
+            Y_train.mean(),
+            Y_train.std(),
+            Y_val.mean(),
+            Y_val.std(),
+        )
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -559,8 +584,14 @@ def train_gcn_model(
         hist["val_mse"].append(val_mse)
         hist["val_rmse"].append(val_rmse)
 
-        print(
-            f"[EPOCH {epoch:03d}] train_MSE={train_mse:.6e}  val_MSE={val_mse:.6e}  val_RMSE={val_rmse:.6e}"
+        detail(
+            logger,
+            "Epoch %03d/%03d: train_MSE=%.6e, val_MSE=%.6e, val_RMSE=%.6e",
+            epoch,
+            epochs,
+            train_mse,
+            val_mse,
+            val_rmse,
         )
 
         # --- Early stopping check ---
@@ -573,10 +604,15 @@ def train_gcn_model(
         else:
             no_improve += 1
             if early_stopping and no_improve >= es_patience:
-                print(f"[ES] Early stopping at epoch {epoch} (best val_MSE={best_val:.6e})")
+                detail(
+                    logger,
+                    "Early stopping at epoch %d (best val_MSE=%.6e)",
+                    epoch,
+                    best_val,
+                )
                 if es_restore_best and best_state is not None:
                     model.load_state_dict(best_state)
-                    print("[ES] Restored best model weights")
+                    detail(logger, "Restored best model weights")
                 break
 
     return model, hist
