@@ -1,89 +1,93 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/geometry_projection.py
+"""Geometry-aware projection utilities for Lagrangian particle positions."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
 import numpy as np
 import trimesh
 
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
+
 
 class GeometryProjector:
-    """
-    Geometry-aware projector using an STL volume.
+    """Project particle positions into a valid volume defined by an STL mesh.
 
-    Assumes the STL is a closed, watertight mesh describing the *valid* region
-    for particles (usually the fluid region of the reactor).
+    The STL is expected to be a closed, watertight mesh describing the valid
+    particle region, which is typically the reactor's fluid volume.
     """
 
-    def __init__(self, stl_path: str | Path):
+    def __init__(self, stl_path: str | Path) -> None:
         stl_path = Path(stl_path)
         if not stl_path.exists():
             raise FileNotFoundError(f"[Lagrangian] STL file not found: {stl_path}")
 
-        print(f"[INFO] Loading geometry STL: {stl_path}")
+        detail(logger, "[Lagrangian] Loading geometry STL: %s", stl_path)
         self.mesh = trimesh.load_mesh(stl_path, process=True)
 
         if not self.mesh.is_watertight:
-            print("[WARN] STL mesh is not watertight; contains() may be unreliable.")
+            logger.warning(
+                "[Lagrangian] STL mesh is not watertight; point-containment "
+                "checks may be unreliable."
+            )
 
     def project_points_inside(self, xyz: np.ndarray) -> np.ndarray:
-        """
-        Project points into the valid volume defined by the STL mesh.
+        """Project points into the valid volume defined by the STL mesh.
 
-        Args:
-            xyz: array of shape (M, 3) with point coordinates.
+        Parameters
+        ----------
+        xyz:
+            Point coordinates with shape ``(M, 3)``.
 
-        Returns:
-            xyz_proj: array (M, 3) where any point that was outside has been
-                      snapped onto (or slightly into) the mesh surface.
-        """
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            raise ValueError(f"xyz must be (M, 3), got {xyz.shape}")
-
-        # 1) Boolean mask: which points are inside?
-        inside = self.mesh.contains(xyz)
-
-        # 2) For outside points, find nearest point on the surface
-        outside_idx = np.where(~inside)[0]
-        xyz_proj = xyz.copy()
-
-        if len(outside_idx) > 0:
-            pts_out = xyz[outside_idx]
-
-            # nearest.on_surface returns (points, distances, triangle_index)
-            nearest_pts, _, tri_idx = self.mesh.nearest.on_surface(pts_out)
-
-            # Optional: nudge slightly inward along -normal to avoid being just outside
-            normals = self.mesh.face_normals[tri_idx]   # outward normals
-            eps = 1e-4
-
-            # Try moving slightly opposite the normal; if that is still outside,
-            # just use the nearest point itself.
-            candidate_inside = self.mesh.contains(nearest_pts - eps * normals)
-            nearest_pts_adj = nearest_pts.copy()
-            nearest_pts_adj[candidate_inside] -= eps * normals[candidate_inside]
-
-            xyz_proj[outside_idx] = nearest_pts_adj
-
-        return xyz_proj
-
-
-    def project(self, p: np.ndarray) -> np.ndarray:
-        """
-        Project a single point into the STL-defined volume.
-        Thin wrapper over project_points_inside for a single (3,) vector.
-        """
-        p = np.asarray(p, dtype=float).reshape(1, 3)
-        return self.project_points_inside(p)[0]
-
-    def project_points(self, xyz: np.ndarray) -> np.ndarray:
-        """Vectorised projection for an array of points.
-
-        This is a thin wrapper around :meth:`project_points_inside` and
-        does **not** loop per-point in Python. It expects ``xyz`` to be
-        of shape (M, 3) and returns an array of the same shape.
+        Returns
+        -------
+        np.ndarray
+            An array with shape ``(M, 3)`` in which outside points have been
+            moved onto, or slightly inside, the mesh surface.
         """
         xyz = np.asarray(xyz, dtype=float)
         if xyz.ndim != 2 or xyz.shape[1] != 3:
             raise ValueError(f"xyz must be (M, 3), got {xyz.shape}")
+
+        inside = self.mesh.contains(xyz)
+        outside_idx = np.flatnonzero(~inside)
+        xyz_proj = xyz.copy()
+
+        if outside_idx.size == 0:
+            return xyz_proj
+
+        points_outside = xyz[outside_idx]
+
+        # ``on_surface`` returns surface points, distances, and triangle IDs.
+        nearest_points, _, triangle_idx = self.mesh.nearest.on_surface(
+            points_outside
+        )
+
+        # Move surface points slightly opposite their outward face normal. If
+        # that candidate is not inside, retain the nearest surface point.
+        normals = self.mesh.face_normals[triangle_idx]
+        epsilon = 1.0e-4
+        inward_candidates = nearest_points - epsilon * normals
+        candidate_inside = self.mesh.contains(inward_candidates)
+
+        adjusted_points = nearest_points.copy()
+        adjusted_points[candidate_inside] = inward_candidates[candidate_inside]
+        xyz_proj[outside_idx] = adjusted_points
+
+        return xyz_proj
+
+    def project(self, point: np.ndarray) -> np.ndarray:
+        """Project one point with shape ``(3,)`` into the STL volume."""
+        point = np.asarray(point, dtype=float).reshape(1, 3)
+        return self.project_points_inside(point)[0]
+
+    def project_points(self, xyz: np.ndarray) -> np.ndarray:
+        """Project an array of points without a per-point Python loop."""
         return self.project_points_inside(xyz)
+
+
+__all__ = ["GeometryProjector"]

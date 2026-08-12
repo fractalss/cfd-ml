@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import copy
+import logging
+
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
+
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
 
 
 class LatentRegressorMLP(nn.Module):
@@ -46,12 +53,11 @@ def build_latent_regression_dataloaders(
     random_state: int = 42,
     shuffle: bool = True,
 ):
-    """
-    Build train/val dataloaders for latent regression.
+    """Build train/validation dataloaders for latent regression.
 
     Args:
-        params_aug: np.ndarray [S, P]
-        latents:    np.ndarray [S, Z]
+        params_aug: Array with shape ``[S, P]``.
+        latents: Array with shape ``[S, Z]``.
     """
     params_aug = np.asarray(params_aug, dtype=np.float32)
     latents = np.asarray(latents, dtype=np.float32)
@@ -62,7 +68,7 @@ def build_latent_regression_dataloaders(
         raise ValueError(f"latents must be 2D [S,Z], got {latents.shape}")
     if params_aug.shape[0] != latents.shape[0]:
         raise ValueError(
-            f"params_aug and latents must have same number of samples, got "
+            "params_aug and latents must have same number of samples, got "
             f"{params_aug.shape[0]} and {latents.shape[0]}"
         )
 
@@ -80,10 +86,24 @@ def build_latent_regression_dataloaders(
         )
 
     generator = torch.Generator().manual_seed(random_state)
-    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=generator)
+    train_ds, val_ds = random_split(
+        dataset,
+        [n_train, n_val],
+        generator=generator,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
 
     return train_loader, val_loader
 
@@ -98,11 +118,13 @@ def train_latent_regressor_torch(
     weight_decay: float = 1e-4,
     patience: int = 5,
 ):
-    """
-    Train latent regressor on params_aug -> latent.
-    """
+    """Train a latent regressor that maps augmented parameters to latents."""
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
     criterion = nn.MSELoss()
 
     best_val = float("inf")
@@ -124,9 +146,9 @@ def train_latent_regressor_torch(
             loss.backward()
             optimizer.step()
 
-            bs = xb.shape[0]
-            train_loss += float(loss.item()) * bs
-            n_train += bs
+            batch_size = xb.shape[0]
+            train_loss += float(loss.item()) * batch_size
+            n_train += batch_size
 
         train_loss /= max(n_train, 1)
 
@@ -141,15 +163,19 @@ def train_latent_regressor_torch(
                 pred = model(xb)
                 loss = criterion(pred, yb)
 
-                bs = xb.shape[0]
-                val_loss += float(loss.item()) * bs
-                n_val += bs
+                batch_size = xb.shape[0]
+                val_loss += float(loss.item()) * batch_size
+                n_val += batch_size
 
         val_loss /= max(n_val, 1)
 
-        print(
-            f"[LatentReg][Epoch {epoch + 1}/{epochs}] "
-            f"train={train_loss:.6f}, val={val_loss:.6f}"
+        detail(
+            logger,
+            "[LatentReg][Epoch %d/%d] train=%.6f, val=%.6f",
+            epoch + 1,
+            epochs,
+            train_loss,
+            val_loss,
         )
 
         if val_loss < best_val:
@@ -159,7 +185,10 @@ def train_latent_regressor_torch(
         else:
             patience_ctr += 1
             if patience_ctr >= patience:
-                print(f"[LatentReg] Early stopping at epoch {epoch + 1}")
+                logger.info(
+                    "[LatentReg] Early stopping at epoch %d",
+                    epoch + 1,
+                )
                 break
 
     if best_state is not None:

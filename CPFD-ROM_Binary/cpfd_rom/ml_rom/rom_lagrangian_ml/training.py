@@ -1,7 +1,17 @@
+from __future__ import annotations
+
+import logging
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+from cpfd_rom.util.logging_config import DETAIL_LEVEL, detail
+
+
+logger = logging.getLogger(__name__)
+
 
 def _forward_pointnet_gnn(model, batch, device):
     batch = batch.to(device)
@@ -25,40 +35,31 @@ def _forward_pointnet_gnn(model, batch, device):
     recon, graph_latent = model(x, edge_index, batch_idx, params, time=time)
     return recon, target, graph_latent, batch_idx
 
+
 def _batch_com_and_spread_loss(pred_xyz, true_xyz, batch_idx):
-    """
-    Compute COM and spread loss per graph in a PyG batch, then average across graphs.
-
-    Args:
-        pred_xyz: [N_total, 3]
-        true_xyz: [N_total, 3]
-        batch_idx: [N_total] graph id per node
-
-    Returns:
-        loss_com, loss_spread
-    """
+    """Compute mean COM and spread losses across graphs in a PyG batch."""
     unique_graphs = torch.unique(batch_idx)
 
     com_losses = []
     spread_losses = []
 
-    for g in unique_graphs:
-        mask = (batch_idx == g)
-        pred_g = pred_xyz[mask]
-        true_g = true_xyz[mask]
+    for graph_id in unique_graphs:
+        mask = batch_idx == graph_id
+        pred_graph = pred_xyz[mask]
+        true_graph = true_xyz[mask]
 
-        if pred_g.size(0) < 2:
+        if pred_graph.size(0) < 2:
             continue
 
-        pred_mean = torch.mean(pred_g, dim=0)
-        true_mean = torch.mean(true_g, dim=0)
+        pred_mean = torch.mean(pred_graph, dim=0)
+        true_mean = torch.mean(true_graph, dim=0)
         com_losses.append(F.l1_loss(pred_mean, true_mean))
 
-        pred_std = torch.std(pred_g, dim=0, unbiased=False)
-        true_std = torch.std(true_g, dim=0, unbiased=False)
+        pred_std = torch.std(pred_graph, dim=0, unbiased=False)
+        true_std = torch.std(true_graph, dim=0, unbiased=False)
         spread_losses.append(F.l1_loss(pred_std, true_std))
 
-    if len(com_losses) == 0:
+    if not com_losses:
         zero = pred_xyz.new_tensor(0.0)
         return zero, zero
 
@@ -71,21 +72,15 @@ def train_pointnet_gnn_torch(
     model,
     dataset,
     device,
-    epochs=100,
-    lr=1e-3,
-    batch_size=4,
+    epochs: int = 100,
+    lr: float = 1e-3,
+    batch_size: int = 4,
     grad_clip_norm: float = 1.0,
     field_loss_weight: float = 1.0,
     com_loss_weight: float = 0.0,
     spread_loss_weight: float = 0.0,
 ):
-    """
-    Train the PointNet-GNN autoencoder to reconstruct normalized [x, y, z, field].
-
-    Additional geometry-aware xyz losses:
-      - COM loss: match mean x,y,z per graph
-      - Spread loss: match std(x), std(y), std(z) per graph
-    """
+    """Train the PointNet-GNN autoencoder on normalized particle fields."""
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -96,6 +91,8 @@ def train_pointnet_gnn_torch(
         drop_last=False,
     )
 
+    show_progress = logger.isEnabledFor(DETAIL_LEVEL)
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -104,7 +101,12 @@ def train_pointnet_gnn_torch(
         total_com = 0.0
         total_spread = 0.0
 
-        for batch in tqdm(loader, desc=f"[Epoch {epoch + 1}/{epochs}]"):
+        for batch in tqdm(
+            loader,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            disable=not show_progress,
+        ):
             optimizer.zero_grad()
 
             pred, target, _, batch_idx = _forward_pointnet_gnn(model, batch, device)
@@ -129,7 +131,9 @@ def train_pointnet_gnn_torch(
             loss.backward()
 
             if grad_clip_norm is not None and grad_clip_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip_norm
+                )
 
             optimizer.step()
 
@@ -146,12 +150,24 @@ def train_pointnet_gnn_torch(
         avg_com = total_com / n_batches
         avg_spread = total_spread / n_batches
 
-        print(
-            f"  [Epoch {epoch + 1}] Avg Loss: {avg_loss:.6f} "
-            f"(xyz={avg_xyz:.6f}, field={avg_field:.6f}, "
-            f"com={avg_com:.6f}, spread={avg_spread:.6f}, "
-            f"field_weight={field_loss_weight}, "
-            f"com_weight={com_loss_weight}, spread_weight={spread_loss_weight})"
+        detail(
+            logger,
+            "[Epoch %d/%d] avg_loss=%.6f "
+            "(xyz=%.6f, field=%.6f, com=%.6f, spread=%.6f, "
+            "field_weight=%s, com_weight=%s, spread_weight=%s)",
+            epoch + 1,
+            epochs,
+            avg_loss,
+            avg_xyz,
+            avg_field,
+            avg_com,
+            avg_spread,
+            field_loss_weight,
+            com_loss_weight,
+            spread_loss_weight,
         )
 
     return model
+
+
+__all__ = ["train_pointnet_gnn_torch"]
