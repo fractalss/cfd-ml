@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from pathlib import Path
@@ -14,6 +15,13 @@ from torch_geometric.nn import radius_graph
 from tqdm import tqdm
 
 from cpfd_rom.util.file_parsing import get_columns_from_json_cached
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
+
+# The shared DETAIL level sits between DEBUG (10) and INFO (20).
+DETAIL_LEVEL = logging.INFO - 5
 
 
 RAW_REQUIRED_BASE = [
@@ -325,7 +333,7 @@ def load_lagrangian_snapshots_as_graphs(
 
     rev_paths = [Path(base_data_dir) / rev for rev in rev_dirs]
 
-    print("[DataLoader] Scanning raw-particle files for time range and schema...")
+    logger.info("[DataLoader] Scanning raw-particle files for time range and schema...")
     rev_meta: dict[str, dict] = {}
 
     for rev_path in rev_paths:
@@ -338,12 +346,12 @@ def load_lagrangian_snapshots_as_graphs(
 
     t_min = float(min(all_times))
     t_max = float(max(all_times))
-    print(f"[DataLoader] Global time range: t_min={t_min:.6f}, t_max={t_max:.6f}")
+    detail(logger, "[DataLoader] Global time range: t_min=%.6f, t_max=%.6f", t_min, t_max)
 
     if t_max == t_min:
         raise ValueError("[Lagrangian/Raw] Zero time range  all snapshot times are identical.")
 
-    print("[DataLoader] Loading raw-particle snapshots and constructing graphs...")
+    logger.info("[DataLoader] Loading raw-particle snapshots and constructing graphs...")
 
     for rev_path in rev_paths:
         meta = rev_meta[str(rev_path)]
@@ -364,6 +372,7 @@ def load_lagrangian_snapshots_as_graphs(
             desc=f"[DataLoader] {rev_name}",
             unit="snapshot",
             leave=True,
+            disable=not logger.isEnabledFor(DETAIL_LEVEL),
         ):
             json_path = snap["json_path"]
             npy_path = snap["npy_path"]
@@ -420,15 +429,16 @@ def load_lagrangian_snapshots_as_graphs(
             all_graphs.append(data)
 
             if verbose_timing:
-                print(
-                    f"[Timing] {json_path.name}: "
-                    f"load={t1 - t0:.3f}s, "
-                    f"extract={t2 - t1:.3f}s, "
-                    f"tensor={t3 - t2:.3f}s, "
-                    f"graph={t4 - t3:.3f}s"
+                logger.debug(
+                    "[Timing] %s: load=%.3fs, extract=%.3fs, tensor=%.3fs, graph=%.3fs",
+                    json_path.name,
+                    t1 - t0,
+                    t2 - t1,
+                    t3 - t2,
+                    t4 - t3,
                 )
 
-    print(f"[DataLoader] Total graphs loaded: {len(all_graphs)}")
+    logger.info("[DataLoader] Total graphs loaded: %d", len(all_graphs))
     return all_graphs
 
 
@@ -457,9 +467,11 @@ def get_initial_template_graph(graphs: list[Data]) -> Data:
     if not hasattr(g0, "time"):
         raise AttributeError("[Lagrangian/Raw] Initial template graph is missing time.")
 
-    print(
-        f"[TemplateInit] Using initial template snapshot '{g0.snapshot_name}' "
-        f"at time {float(g0.time.item()):.6f}"
+    detail(
+        logger,
+        "[TemplateInit] Using initial template snapshot '%s' at time %.6f",
+        g0.snapshot_name,
+        float(g0.time.item()),
     )
     return g0
 
@@ -502,9 +514,12 @@ def extract_scaffold_graphs(
     nearest_rev = rev_list[best_r]
     nearest_rev_name = Path(nearest_rev).name
 
-    print(
-        f"[TemplateSelect] Using nearest Rev: {nearest_rev} "
-        f"for user_param={user.flatten()}, dist={dists[best_r]:.3e}"
+    detail(
+        logger,
+        "[TemplateSelect] Using nearest Rev: %s for user_param=%s, dist=%.3e",
+        nearest_rev,
+        user.flatten(),
+        dists[best_r],
     )
 
     graphs = load_lagrangian_snapshots_as_graphs(
@@ -527,9 +542,13 @@ def extract_scaffold_graphs(
     graphs = sort_graphs_by_time(graphs)
     g0 = get_initial_template_graph(graphs)
 
-    print(
-        f"[TemplateSelect] Confirmed nearest Rev '{nearest_rev_name}' has "
-        f"{len(graphs)} time-sorted graphs. Initial template = '{g0.snapshot_name}'."
+    detail(
+        logger,
+        "[TemplateSelect] Confirmed nearest Rev '%s' has %d time-sorted graphs. "
+        "Initial template = '%s'.",
+        nearest_rev_name,
+        len(graphs),
+        g0.snapshot_name,
     )
 
     return graphs

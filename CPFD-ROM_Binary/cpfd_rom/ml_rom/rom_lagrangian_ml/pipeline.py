@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 
 import numpy as np
@@ -29,6 +30,10 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import (
 from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
 from cpfd_rom.util.model_utils import setup_model_paths
 from cpfd_rom.util.output_utils import setup_output_dir
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_graphs_in_place(graphs, feature_stats):
@@ -100,14 +105,18 @@ def _validate_reference_times(ref_times: np.ndarray) -> np.ndarray:
     return ref_times
 
 
-def _print_template_alignment_summary(scaffold_graphs, matched_times):
+def _log_template_alignment_summary(scaffold_graphs, matched_times):
     g0 = get_initial_template_graph(scaffold_graphs)
-    print("[TimingMatch] Template alignment summary")
-    print(f"  num_template_graphs     : {len(scaffold_graphs)}")
-    print(f"  first_template_time     : {float(g0.time.item()):.6f}")
-    print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
-    print(f"  first_output_time       : {float(matched_times[0]):.6f}")
-    print(f"  last_output_time        : {float(matched_times[-1]):.6f}")
+    logger.debug(
+        "[TimingMatch] Template alignment summary: num_template_graphs=%d, "
+        "first_template_time=%.6f, first_template_snapshot=%s, "
+        "first_output_time=%.6f, last_output_time=%.6f",
+        len(scaffold_graphs),
+        float(g0.time.item()),
+        getattr(g0, "snapshot_name", "<missing>"),
+        float(matched_times[0]),
+        float(matched_times[-1]),
+    )
 
 
 def _compute_time_bounds_from_graphs(graphs) -> tuple[float, float]:
@@ -202,7 +211,6 @@ def _infer_with_fourier_time(
     override_times,
     t_min: float,
     t_max: float,
-    debug: bool,
 ):
     model = model.to(device).eval()
     latent_regressor = latent_regressor.to(device).eval()
@@ -307,15 +315,22 @@ def _infer_with_fourier_time(
                 tval = float(override_times[graph_counter])
                 times_out.append(tval)
 
-                if debug and graph_counter < 3:
-                    print(f"[Inference][Graph {graph_counter}]")
-                    print(f"  user_parameter         : {float(user_param_vec[0]):.6f}")
-                    print(f"  template_time          : {float(batch.time.view(-1)[g_idx].item()):.6f}")
-                    print(f"  output_time            : {tval:.6f}")
-                    print(f"  template_nodes         : {int(mask.sum().item())}")
-                    print(f"  predicted_xyz_min      : {pos.min(dim=0).values.detach().cpu().numpy()}")
-                    print(f"  predicted_xyz_max      : {pos.max(dim=0).values.detach().cpu().numpy()}")
-                    print(f"  predicted_field_minmax : ({field.min().item():.6e}, {field.max().item():.6e})")
+                if logger.isEnabledFor(logging.DEBUG) and graph_counter < 3:
+                    logger.debug(
+                        "[Inference][Graph %d] user_parameter=%.6f, "
+                        "template_time=%.6f, output_time=%.6f, template_nodes=%d, "
+                        "predicted_xyz_min=%s, predicted_xyz_max=%s, "
+                        "predicted_field_minmax=(%.6e, %.6e)",
+                        graph_counter,
+                        float(user_param_vec[0]),
+                        float(batch.time.view(-1)[g_idx].item()),
+                        tval,
+                        int(mask.sum().item()),
+                        pos.min(dim=0).values.detach().cpu().numpy(),
+                        pos.max(dim=0).values.detach().cpu().numpy(),
+                        field.min().item(),
+                        field.max().item(),
+                    )
 
                 graph_counter += 1
 
@@ -386,7 +401,7 @@ def _save_lagrangian_inference_artifacts(
     }
 
     torch.save(payload, artifact_path)
-    print(f"[ARTIFACT] wrote Lagrangian inference artifacts -> {artifact_path}")
+    logger.info("Wrote Lagrangian inference artifacts to %s", artifact_path)
 
 
 def _load_lagrangian_inference_artifacts(config) -> dict:
@@ -398,7 +413,7 @@ def _load_lagrangian_inference_artifacts(config) -> dict:
             "Run a normal Lagrangian pipeline once before --infer-only."
         )
 
-    print(f"[ARTIFACT] loading Lagrangian inference artifacts <- {artifact_path}")
+    logger.info("Loading Lagrangian inference artifacts from %s", artifact_path)
     return torch.load(artifact_path, map_location="cpu", weights_only=False)
 
 
@@ -410,11 +425,15 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
     extracts nearest-rev scaffold/template graphs because the current decoder path needs
     a template particle cloud for each output time.
     """
-    print("[INFER-ONLY] Lightweight Lagrangian inference mode enabled")
-    print("[INFER-ONLY] Skipping raw training graph loading, dataset construction, AE latent extraction, and training")
+    logger.info("Lightweight Lagrangian inference mode enabled")
+    detail(
+        logger,
+        "Skipping raw training graph loading, dataset construction, AE latent "
+        "extraction, and training",
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
+    detail(logger, "Using device: %s", device)
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"[INFER-ONLY] Missing AE model checkpoint: {model_path}")
@@ -443,8 +462,6 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
     max_num_neighbors = int(art["max_num_neighbors"])
     latent_reg_hidden_dims = art["latent_reg_hidden_dims"]
 
-    inference_debug = bool(getattr(config, "inference_debug", True))
-
     if not getattr(config, "rev_dirs", None):
         raise ValueError("[Lagrangian/InferOnly] config.rev_dirs must be provided.")
     if not hasattr(config, "base_data_dir"):
@@ -457,9 +474,11 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
         raise ValueError("[Lagrangian/InferOnly] config.user_parameter must be set.")
 
     user_param_requests = _as_single_parameter_request_list(config.user_parameter)
-    print("[INFO] Requested Lagrangian scalar user_parameter values:")
-    for pvec in user_param_requests:
-        print(f"  {float(pvec[0]):.6f}")
+    detail(
+        logger,
+        "Requested Lagrangian scalar user_parameter values: %s",
+        ", ".join(f"{float(p[0]):.6f}" for p in user_param_requests),
+    )
 
     model = PointNetGNNAutoencoder(
         in_dim=4,
@@ -475,7 +494,7 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
     ).to(device)
 
     with log_time("Loading pretrained AE model"):
-        print(f"[INFO] Loading pretrained AE model from {model_path}")
+        logger.info("Loading pretrained AE model from %s", model_path)
         model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -486,7 +505,7 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
     ).to(device)
 
     with log_time("Loading pretrained latent regressor"):
-        print(f"[INFO] Loading pretrained latent regressor from {latent_reg_path}")
+        logger.info("Loading pretrained latent regressor from %s", latent_reg_path)
         latent_reg_model.load_state_dict(torch.load(latent_reg_path, map_location=device))
     latent_reg_model.eval()
 
@@ -500,9 +519,11 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
     )
     ref_times = _validate_reference_times(ref_times)
 
-    print(
-        f"[TimingRef] Using reference_time_rev='{reference_time_rev}' "
-        f"with {len(ref_times)} sorted reference times"
+    detail(
+        logger,
+        "Using reference_time_rev='%s' with %d sorted reference times",
+        reference_time_rev,
+        len(ref_times),
     )
 
     lagrangian_root_out = os.path.join(config.output_dir, "Lagrangian_ROM")
@@ -513,12 +534,11 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
         out_dir = os.path.join(lagrangian_root_out, param_dir_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        print("=" * 80)
-        print(
-            f"[INFO] Running Lagrangian ROM inference for "
-            f"user_parameter = {float(user_param_vec[0]):.6f}"
+        logger.info(
+            "Running Lagrangian ROM inference for user_parameter=%.6f",
+            float(user_param_vec[0]),
         )
-        print(f"[INFO] Output directory: {out_dir}")
+        detail(logger, "Output directory: %s", out_dir)
 
         with log_time(f"Extracting nearest-rev template graphs for {param_dir_name}"):
             template_graphs = extract_scaffold_graphs(
@@ -538,11 +558,14 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
         template_graphs = sort_graphs_by_time(template_graphs)
         g0 = get_initial_template_graph(template_graphs)
 
-        print("[TemplateInit] Nearest-rev template initialization confirmed")
-        print(f"  user_parameter          : {float(user_param_vec[0]):.6f}")
-        print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
-        print(f"  first_template_time     : {float(g0.time.item()):.6f}")
-        print(f"  num_template_graphs     : {len(template_graphs)}")
+        logger.debug(
+            "[TemplateInit] user_parameter=%.6f, first_template_snapshot=%s, "
+            "first_template_time=%.6f, num_template_graphs=%d",
+            float(user_param_vec[0]),
+            getattr(g0, "snapshot_name", "<missing>"),
+            float(g0.time.item()),
+            len(template_graphs),
+        )
 
         if len(template_graphs) != len(ref_times):
             raise ValueError(
@@ -554,14 +577,16 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
         matched_graphs = list(template_graphs)
         matched_times = [float(t) for t in ref_times]
 
-        _print_template_alignment_summary(matched_graphs, matched_times)
+        _log_template_alignment_summary(matched_graphs, matched_times)
 
         del template_graphs
         gc.collect()
 
-        print(
-            f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
-            f"to {len(matched_times)} reference times"
+        detail(
+            logger,
+            "Index-aligned %d template graphs to %d reference times",
+            len(matched_graphs),
+            len(matched_times),
         )
 
         with log_time(f"Running Lagrangian ROM inference for {param_dir_name}"):
@@ -576,7 +601,6 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
                 override_times=matched_times,
                 t_min=t_min,
                 t_max=t_max,
-                debug=inference_debug,
             )
 
         write_lagrangian_rom_only(
@@ -587,9 +611,10 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
             time_mode="raw",
         )
 
-        print(
-            f"[INFO] ROM inference complete for user_parameter="
-            f"{float(user_param_vec[0]):.6f}. Output saved to: {out_dir}"
+        logger.info(
+            "ROM inference complete for user_parameter=%.6f. Output saved to %s",
+            float(user_param_vec[0]),
+            out_dir,
         )
 
         del matched_graphs
@@ -600,9 +625,9 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    print(
-        f"[INFO] All Lagrangian ROM inference cases complete. "
-        f"Root output: {lagrangian_root_out}"
+    logger.info(
+        "All Lagrangian ROM inference cases complete. Root output: %s",
+        lagrangian_root_out,
     )
 
     gc.collect()
@@ -614,7 +639,7 @@ def run_lagrangian_infer_only_pipeline(config, log_time, model_path: str, latent
 
 def run_lagrangian_ml_pipeline(config, log_time):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
+    detail(logger, "Using device: %s", device)
 
     setup_output_dir(config)
     setup_model_paths(config)
@@ -657,8 +682,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
     include_raw_time = bool(getattr(config, "include_raw_time", True))
     use_bn = bool(getattr(config, "use_bn", True))
 
-    inference_debug = bool(getattr(config, "inference_debug", True))
-
     if not getattr(config, "rev_dirs", None):
         raise ValueError("[Lagrangian/Raw] config.rev_dirs must be provided.")
     if not hasattr(config, "base_data_dir"):
@@ -671,9 +694,11 @@ def run_lagrangian_ml_pipeline(config, log_time):
         raise ValueError("[Lagrangian/Raw] config.user_parameter must be set.")
 
     user_param_requests = _as_single_parameter_request_list(config.user_parameter)
-    print("[INFO] Requested Lagrangian scalar user_parameter values:")
-    for pvec in user_param_requests:
-        print(f"  {float(pvec[0]):.6f}")
+    detail(
+        logger,
+        "Requested Lagrangian scalar user_parameter values: %s",
+        ", ".join(f"{float(p[0]):.6f}" for p in user_param_requests),
+    )
 
     with log_time("Loading raw-particle training graphs"):
         graphs = load_lagrangian_snapshots_as_graphs(
@@ -692,7 +717,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
             raise RuntimeError("[Lagrangian/Raw] No graphs loaded.")
 
     t_min, t_max = _compute_time_bounds_from_graphs(graphs)
-    print(f"[INFO] Training time range      : [{t_min:.6f}, {t_max:.6f}]")
+    detail(logger, "Training time range: [%.6f, %.6f]", t_min, t_max)
 
     with log_time("Computing feature stats and normalizing training graphs"):
         feature_stats = compute_feature_stats(graphs)
@@ -734,7 +759,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     if getattr(config, "skip_training", False) and os.path.exists(model_path):
         with log_time("Loading pretrained AE model"):
-            print(f"[INFO] Loading pretrained AE model from {model_path}")
+            logger.info("Loading pretrained AE model from %s", model_path)
             model.load_state_dict(torch.load(model_path, map_location=device))
     else:
         with log_time("Training PointNet-GNN autoencoder"):
@@ -751,7 +776,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 spread_loss_weight=spread_loss_weight,
             )
         torch.save(model.state_dict(), model_path)
-        print(f"[INFO] Saved AE model to {model_path}")
+        logger.info("Saved AE model to %s", model_path)
 
     model.eval()
 
@@ -765,8 +790,8 @@ def run_lagrangian_ml_pipeline(config, log_time):
             t_max=t_max,
         )
 
-    print(f"[INFO] Latent matrix shape     : {latents_all.shape}")
-    print(f"[INFO] Regressor input shape  : {reg_inputs_all.shape}")
+    detail(logger, "Latent matrix shape: %s", latents_all.shape)
+    detail(logger, "Regressor input shape: %s", reg_inputs_all.shape)
 
     train_loader_reg, val_loader_reg = build_latent_regression_dataloaders(
         params_aug=reg_inputs_all,
@@ -785,7 +810,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
 
     if getattr(config, "skip_training", False) and os.path.exists(latent_reg_path):
         with log_time("Loading pretrained latent regressor"):
-            print(f"[INFO] Loading pretrained latent regressor from {latent_reg_path}")
+            logger.info("Loading pretrained latent regressor from %s", latent_reg_path)
             latent_reg_model.load_state_dict(torch.load(latent_reg_path, map_location=device))
     else:
         with log_time("Training latent regressor"):
@@ -800,7 +825,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 patience=latent_reg_patience,
             )
         torch.save(latent_reg_model.state_dict(), latent_reg_path)
-        print(f"[INFO] Saved latent regressor to {latent_reg_path}")
+        logger.info("Saved latent regressor to %s", latent_reg_path)
 
     latent_reg_model.eval()
 
@@ -845,9 +870,11 @@ def run_lagrangian_ml_pipeline(config, log_time):
     )
     ref_times = _validate_reference_times(ref_times)
 
-    print(
-        f"[TimingRef] Using reference_time_rev='{reference_time_rev}' "
-        f"with {len(ref_times)} sorted reference times"
+    detail(
+        logger,
+        "Using reference_time_rev='%s' with %d sorted reference times",
+        reference_time_rev,
+        len(ref_times),
     )
 
     lagrangian_root_out = os.path.join(config.output_dir, "Lagrangian_ROM")
@@ -858,12 +885,11 @@ def run_lagrangian_ml_pipeline(config, log_time):
         out_dir = os.path.join(lagrangian_root_out, param_dir_name)
         os.makedirs(out_dir, exist_ok=True)
 
-        print("=" * 80)
-        print(
-            f"[INFO] Running Lagrangian ROM inference for "
-            f"user_parameter = {float(user_param_vec[0]):.6f}"
+        logger.info(
+            "Running Lagrangian ROM inference for user_parameter=%.6f",
+            float(user_param_vec[0]),
         )
-        print(f"[INFO] Output directory: {out_dir}")
+        detail(logger, "Output directory: %s", out_dir)
 
         with log_time(f"Extracting nearest-rev template graphs for {param_dir_name}"):
             template_graphs = extract_scaffold_graphs(
@@ -883,11 +909,14 @@ def run_lagrangian_ml_pipeline(config, log_time):
         template_graphs = sort_graphs_by_time(template_graphs)
         g0 = get_initial_template_graph(template_graphs)
 
-        print("[TemplateInit] Nearest-rev template initialization confirmed")
-        print(f"  user_parameter          : {float(user_param_vec[0]):.6f}")
-        print(f"  first_template_snapshot : {getattr(g0, 'snapshot_name', '<missing>')}")
-        print(f"  first_template_time     : {float(g0.time.item()):.6f}")
-        print(f"  num_template_graphs     : {len(template_graphs)}")
+        logger.debug(
+            "[TemplateInit] user_parameter=%.6f, first_template_snapshot=%s, "
+            "first_template_time=%.6f, num_template_graphs=%d",
+            float(user_param_vec[0]),
+            getattr(g0, "snapshot_name", "<missing>"),
+            float(g0.time.item()),
+            len(template_graphs),
+        )
 
         if len(template_graphs) != len(ref_times):
             raise ValueError(
@@ -899,14 +928,16 @@ def run_lagrangian_ml_pipeline(config, log_time):
         matched_graphs = list(template_graphs)
         matched_times = [float(t) for t in ref_times]
 
-        _print_template_alignment_summary(matched_graphs, matched_times)
+        _log_template_alignment_summary(matched_graphs, matched_times)
 
         del template_graphs
         gc.collect()
 
-        print(
-            f"[TimingMatch] Index-aligned {len(matched_graphs)} template graphs "
-            f"to {len(matched_times)} reference times"
+        detail(
+            logger,
+            "Index-aligned %d template graphs to %d reference times",
+            len(matched_graphs),
+            len(matched_times),
         )
 
         with log_time(f"Running Lagrangian ROM inference for {param_dir_name}"):
@@ -921,7 +952,6 @@ def run_lagrangian_ml_pipeline(config, log_time):
                 override_times=matched_times,
                 t_min=t_min,
                 t_max=t_max,
-                debug=inference_debug,
             )
 
         write_lagrangian_rom_only(
@@ -932,9 +962,10 @@ def run_lagrangian_ml_pipeline(config, log_time):
             time_mode="raw",
         )
 
-        print(
-            f"[INFO] ROM inference complete for user_parameter="
-            f"{float(user_param_vec[0]):.6f}. Output saved to: {out_dir}"
+        logger.info(
+            "ROM inference complete for user_parameter=%.6f. Output saved to %s",
+            float(user_param_vec[0]),
+            out_dir,
         )
 
         del matched_graphs
@@ -952,7 +983,7 @@ def run_lagrangian_ml_pipeline(config, log_time):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(
-        f"[INFO] All Lagrangian ROM inference cases complete. "
-        f"Root output: {lagrangian_root_out}"
+    logger.info(
+        "All Lagrangian ROM inference cases complete. Root output: %s",
+        lagrangian_root_out,
     )

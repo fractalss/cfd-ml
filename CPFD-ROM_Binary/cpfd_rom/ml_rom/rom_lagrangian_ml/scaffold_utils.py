@@ -1,51 +1,71 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/scaffold_utils.py
+"""Utilities for selecting Lagrangian scaffold graphs."""
 
-import os
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 import numpy as np
-from typing import List, Dict
 from torch_geometric.data import Data
+
+from cpfd_rom.util.logging_config import detail
 
 from .data_loader import load_lagrangian_snapshots_as_graphs
 
+
+logger = logging.getLogger(__name__)
+
+
 def get_scaffold_graphs_for_param(
     user_param: float,
-    param_mapping: Dict[str, float],
-    rev_dirs: List[str],
+    param_mapping: Mapping[str, float],
+    rev_dirs: Sequence[str],
     base_data_dir: str,
     field_variable: str = "Particle volume fraction",
     radius: float = 0.01,
     sample_ratio: float = 1.0,
-    feature_stats: Dict = None,
-) -> List[Data]:
-    """
-    Selects the closest Rev directory based on user_param and loads its graphs as templates.
+    feature_stats: Mapping[str, Any] | None = None,
+) -> list[Data]:
+    """Load scaffold graphs from the available revision nearest ``user_param``.
 
-    Args:
-        user_param: The user's physical parameter (float).
-        param_mapping: Dict mapping rev_dir names (e.g. 'Rev1') to physical parameters.
-        rev_dirs: List of rev_dir names to search.
-        base_data_dir: Path to base folder containing rev_dir subfolders.
-        field_variable: Name of field variable (optional).
-        radius: Radius used to build edge connections in graphs.
-        sample_ratio: Fraction of snapshots to sample (e.g. 1.0 = all).
-        feature_stats: Optional normalization stats (used if graphs need to be normalized).
-
-    Returns:
-        List[Data]: Graphs from the closest rev_dir to the user_param.
+    Only revisions present in both ``rev_dirs`` and ``param_mapping`` are
+    considered. The selected revision is passed to the standard Lagrangian
+    graph loader without changing its sampling or normalization behavior.
     """
     if not param_mapping:
         raise ValueError("param_mapping is required.")
+    if not rev_dirs:
+        raise ValueError("rev_dirs must contain at least one revision directory.")
 
-    # Match closest Rev
-    rev_list = list(param_mapping.keys())
-    rev_params = np.array([param_mapping[r] for r in rev_list])
-    idx_closest = np.argmin(np.abs(rev_params - user_param))
-    rev_closest = rev_list[idx_closest]
-    print(f"[Scaffold] Closest Rev to param={user_param:.4f} is '{rev_closest}' with param={rev_params[idx_closest]:.4f}")
+    candidate_revs = [rev for rev in rev_dirs if rev in param_mapping]
+    if not candidate_revs:
+        raise ValueError(
+            "None of the requested rev_dirs are present in param_mapping."
+        )
 
-    # Load graphs only from this Rev
-    graphs = load_lagrangian_snapshots_as_graphs(
-        rev_dirs=[rev_closest],
+    rev_params = np.asarray(
+        [param_mapping[rev] for rev in candidate_revs], dtype=np.float64
+    )
+    if not np.all(np.isfinite(rev_params)):
+        raise ValueError("param_mapping values must be finite numbers.")
+    if not np.isfinite(user_param):
+        raise ValueError("user_param must be a finite number.")
+
+    closest_index = int(np.argmin(np.abs(rev_params - float(user_param))))
+    closest_rev = candidate_revs[closest_index]
+    closest_param = float(rev_params[closest_index])
+
+    detail(
+        logger,
+        "[Scaffold] Closest revision to param=%.4f is '%s' with param=%.4f",
+        user_param,
+        closest_rev,
+        closest_param,
+    )
+
+    return load_lagrangian_snapshots_as_graphs(
+        rev_dirs=[closest_rev],
         base_data_dir=base_data_dir,
         param_mapping=param_mapping,
         field_variable=field_variable,
@@ -54,4 +74,5 @@ def get_scaffold_graphs_for_param(
         feature_stats=feature_stats,
     )
 
-    return graphs
+
+__all__ = ["get_scaffold_graphs_for_param"]
