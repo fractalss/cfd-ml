@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional, Tuple, Sequence
@@ -15,6 +16,10 @@ import torch
 
 from cpfd_rom.util.model_utils import setup_model_paths
 from cpfd_rom.util.output_utils import setup_output_dir
+from cpfd_rom.util.logging_config import detail
+
+
+logger = logging.getLogger(__name__)
 
 # graph + datasets
 from .loader import prepare_graph_and_datasets, list_targets
@@ -432,11 +437,11 @@ def _save_eulerian_inference_artifacts(
 
     try:
         torch.save(payload, artifact_path)
-        print(f"[ARTIFACT] wrote Eulerian inference artifacts -> {artifact_path}")
+        detail(logger, "Wrote Eulerian inference artifacts to %s", artifact_path)
     except Exception as e:
         # Do not make a successful training run fail just because artifact caching
         # could not serialize an optional helper object such as a custom baseline.
-        print(f"[ARTIFACT] WARNING: failed to write Eulerian inference artifacts: {e}")
+        logger.warning("Failed to write Eulerian inference artifacts: %s", e)
 
 
 def _load_eulerian_inference_artifacts(cfg) -> dict:
@@ -447,7 +452,7 @@ def _load_eulerian_inference_artifacts(cfg) -> dict:
             "Run a normal training/full pipeline once before using --infer-only."
         )
 
-    print(f"[ARTIFACT] loading Eulerian inference artifacts <- {artifact_path}")
+    logger.info("Loading Eulerian inference artifacts from %s", artifact_path)
     return torch.load(artifact_path, map_location="cpu", weights_only=False)
 
 
@@ -487,7 +492,12 @@ def _run_eulerian_inference_outputs(
         targets = list_targets(ref_dir)
         times = np.array([t for t, _ in targets], dtype=float)
 
-        print(f"[INFER] predicting {len(times)} snapshots for user_parameters={user_parameters}")
+        logger.info(
+            "Running Eulerian inference for %d snapshot(s) and %d operating parameter(s)",
+            len(times),
+            len(user_parameters),
+        )
+        detail(logger, "Inference operating parameters: %s", user_parameters)
 
         # Time statistics must match the training time feature construction.
         if time_cfg.add_time and times_train is not None and len(times_train) > 0:
@@ -507,10 +517,10 @@ def _run_eulerian_inference_outputs(
         # FILE-order node dataframe is independent of operating parameter.
         nodes_df_file = to_file_order(nodes_df, colmap_canon, dataframe=True)
 
-        print(f"[CLIP] global [{y_lo:.6e}, {y_hi:.6e}]")
+        detail(logger, "Clipping predictions to training range [%.6e, %.6e]", y_lo, y_hi)
 
         for user_param_i in user_parameters:
-            print(f"[INFER] user_parameter={user_param_i:.6f}")
+            detail(logger, "Predicting user_parameter=%.6f", user_param_i)
 
             params_row = ((np.array([user_param_i], dtype=np.float32) - p_mu) / p_std).astype(np.float32)
 
@@ -561,7 +571,11 @@ def _run_eulerian_inference_outputs(
 
             # Parameter-specific ROM directory for transient ML / baseline+ output.
             out_dir = _rom_param_output_dir(cfg, user_param_i)
-            print(f"[WRITE] user_parameter={user_param_i:.6f} -> {out_dir}")
+            logger.info(
+                "Writing Eulerian ROM output for user_parameter=%.6f to %s",
+                user_param_i,
+                out_dir,
+            )
 
             _write_rom_only(
                 preds_file,
@@ -597,8 +611,11 @@ def run_ml_rom_infer_only_pipeline(cfg, log_time, model_path_pt: Path):
     construction, normalization fitting, and model training. It requires that a
     normal/full run has already written the checkpoint and inference artifact.
     """
-    print("[INFER-ONLY] Lightweight Eulerian inference mode enabled")
-    print("[INFER-ONLY] Skipping graph rebuild, snapshot target generation, dataset construction, and training")
+    logger.info("Running lightweight Eulerian inference-only pipeline")
+    detail(
+        logger,
+        "Skipping graph rebuild, snapshot target generation, dataset construction, and training",
+    )
 
     from types import SimpleNamespace
 
@@ -627,10 +644,14 @@ def run_ml_rom_infer_only_pipeline(cfg, log_time, model_path_pt: Path):
     if use_baseline_as_feature:
         in_dim += 1
 
-    print(
-        f"[INFER-ONLY] in_dim={in_dim}  X={X_node.shape[1]}  P={p_dim}  "
-        f"t={(int(time_cfg.t_feat_dim) if bool(time_cfg.add_time) else 0)}  "
-        f"baseline={'yes' if use_baseline_as_feature else 'no'}"
+    detail(
+        logger,
+        "Inference model dimensions: in_dim=%d, X=%d, P=%d, time=%d, baseline=%s",
+        in_dim,
+        X_node.shape[1],
+        p_dim,
+        int(time_cfg.t_feat_dim) if bool(time_cfg.add_time) else 0,
+        "yes" if use_baseline_as_feature else "no",
     )
 
     mc = art.get("model_config", {})
@@ -697,6 +718,7 @@ def run_ml_rom_pipeline(cfg, log_time):
       - per-ROM metadata files
     """
     # --- Setup ---
+    logger.info("Preparing Eulerian ML ROM pipeline")
     setup_output_dir(cfg)
     setup_model_paths(cfg)
     model_path_pt = torch_model_path(cfg.model_path_eulerian)
@@ -710,6 +732,7 @@ def run_ml_rom_pipeline(cfg, log_time):
         )
 
     # --- Build canonical graph + datasets. First rev defines graph. ---
+    logger.info("Preparing Eulerian graph and datasets")
     with log_time("Preparing graph & datasets from rev_dirs"):
         (
             ref_rev,
@@ -734,9 +757,9 @@ def run_ml_rom_pipeline(cfg, log_time):
             import pandas as pd
 
             coords_file_df = pd.read_parquet(coords_path)[["i", "j", "k"]]
-            print("[ALIGN] Using coords_file_order.parquet for FILE->NODE mapping")
+            detail(logger, "Using coords_file_order.parquet for FILE-to-NODE mapping")
         except Exception as e:
-            print(f"[ALIGN] WARNING: failed to read {coords_path.name}: {e}")
+            logger.warning("Failed to read %s: %s", coords_path.name, e)
 
     if coords_file_df is None:
         coords_file_df = maybe_load_coords_file_df(
@@ -764,24 +787,42 @@ def run_ml_rom_pipeline(cfg, log_time):
     S_tr, S_va = int(Y_train.shape[0]), int(Y_val.shape[0])
     P_dim = int(P_train.shape[1]) if P_train.size else 0
 
-    print(f"[DATA] N(nodes)={N}  E(edges)={E}  S_train={S_tr}  S_val={S_va}  P_dim={P_dim}")
-    print(
-        f"[DATA] X_node shape={tuple(X_node.shape)}  "
-        f"Y_train shape={tuple(Y_train.shape)}  P_train shape={tuple(P_train.shape)}"
+    detail(
+        logger,
+        "Dataset: nodes=%d, edges=%d, training samples=%d, validation samples=%d, parameter dimensions=%d",
+        N,
+        E,
+        S_tr,
+        S_va,
+        P_dim,
+    )
+    detail(
+        logger,
+        "Dataset shapes: X_node=%s, Y_train=%s, P_train=%s",
+        tuple(X_node.shape),
+        tuple(Y_train.shape),
+        tuple(P_train.shape),
     )
 
     user_parameters = _resolve_user_parameters(cfg)
     user_param = float(user_parameters[0])
     pmin, pmax = float(P_train.min()), float(P_train.max())
-    print(f"[PARAM] train_range=[{pmin:.6f},{pmax:.6f}]  user={user_param:.6f}  inside_range={pmin <= user_param <= pmax}")
-    print(f"[PARAM] inference user_parameters={user_parameters}")
+    detail(
+        logger,
+        "Training parameter range=[%.6f, %.6f]; first inference parameter=%.6f; inside_range=%s",
+        pmin,
+        pmax,
+        user_param,
+        pmin <= user_param <= pmax,
+    )
+    detail(logger, "Inference operating parameters: %s", user_parameters)
 
     # --- Normalization: target and parameter. ---
     y_mu = float(np.mean(Y_train))
     y_std_raw = float(np.std(Y_train))
     y_std = y_std_raw if y_std_raw > 0 else 1.0
 
-    print(f"[Y-NORM] mu={y_mu:.6e} std={y_std:.6e} (scalar)")
+    detail(logger, "Target normalization: mean=%.6e, std=%.6e (scalar)", y_mu, y_std)
 
     Y_train_n_scalar = (Y_train - y_mu) / y_std
     Y_val_n_scalar = (Y_val - y_mu) / y_std if Y_val.size else Y_val
@@ -793,7 +834,12 @@ def run_ml_rom_pipeline(cfg, log_time):
     P_train_n = (P_train - p_mu) / p_std
     P_val_n = (P_val - p_mu) / p_std
 
-    print(f"[PARAM NORM] mu={p_mu.ravel().tolist()}  std={p_std.ravel().tolist()}")
+    detail(
+        logger,
+        "Parameter normalization: mean=%s, std=%s",
+        p_mu.ravel().tolist(),
+        p_std.ravel().tolist(),
+    )
 
     # --- Time feature configuration. ---
     time_cfg = resolve_time_features(cfg, times_train)
@@ -884,28 +930,42 @@ def run_ml_rom_pipeline(cfg, log_time):
             if times_val is not None and len(times_val):
                 base_va_fields = baseline_model.predict_samples(times_val, P_val)
 
-            print(f"[BASELINE] base_tr_fields shape={None if base_tr_fields is None else base_tr_fields.shape}")
-            print(f"[BASELINE] base_va_fields shape={None if base_va_fields is None else base_va_fields.shape}")
+            detail(
+                logger,
+                "Baseline field shapes: training=%s, validation=%s",
+                None if base_tr_fields is None else base_tr_fields.shape,
+                None if base_va_fields is None else base_va_fields.shape,
+            )
 
             if base_tr_fields is None:
                 raise RuntimeError("Baseline fields for training could not be constructed.")
 
             if base_va_fields is None:
-                print("[WARN] No baseline fields for validation; using zeros as dummy baseline.")
+                logger.warning("No validation baseline fields; using zeros as a fallback")
                 base_va_fields = np.zeros_like(Y_val, dtype=np.float32)
 
             R_tr = (Y_train - base_tr_fields).astype(np.float32)
             R_va = (Y_val - base_va_fields).astype(np.float32)
 
-            print(f"[RESIDUAL RAW] Train mean/std {R_tr.mean():.3e}/{R_tr.std():.3e}")
-            print(f"[RESIDUAL RAW] Val   mean/std {R_va.mean():.3e}/{R_va.std():.3e}")
-            print(f"[RESIDUAL RAW] Max node std train={np.max(R_tr.std(axis=0)):.3e}, val={np.max(R_va.std(axis=0)):.3e}")
-            print(f"[RESIDUAL RAW] Min node std train={np.min(R_tr.std(axis=0)):.3e}, val={np.min(R_va.std(axis=0)):.3e}")
-
-            snap_tr_std = np.std(R_tr, axis=1)
-            snap_va_std = np.std(R_va, axis=1)
-            print(f"[RESIDUAL SNAP] Train snapshot std range {snap_tr_std.min():.3e}-{snap_tr_std.max():.3e}")
-            print(f"[RESIDUAL SNAP] Val   snapshot std range {snap_va_std.min():.3e}-{snap_va_std.max():.3e}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Raw training residual mean/std: %.3e/%.3e", R_tr.mean(), R_tr.std())
+                logger.debug("Raw validation residual mean/std: %.3e/%.3e", R_va.mean(), R_va.std())
+                logger.debug(
+                    "Residual node std range: training=[%.3e, %.3e], validation=[%.3e, %.3e]",
+                    np.min(R_tr.std(axis=0)),
+                    np.max(R_tr.std(axis=0)),
+                    np.min(R_va.std(axis=0)),
+                    np.max(R_va.std(axis=0)),
+                )
+                snap_tr_std = np.std(R_tr, axis=1)
+                snap_va_std = np.std(R_va, axis=1)
+                logger.debug(
+                    "Residual snapshot std range: training=[%.3e, %.3e], validation=[%.3e, %.3e]",
+                    snap_tr_std.min(),
+                    snap_tr_std.max(),
+                    snap_va_std.min(),
+                    snap_va_std.max(),
+                )
 
             pernode = bool(getattr(cfg, "residual_pernode_norm", True))
             eps = 1e-8
@@ -914,9 +974,15 @@ def run_ml_rom_pipeline(cfg, log_time):
                 mu = R_tr.mean(axis=0)  # (N,)
                 std = R_tr.std(axis=0) + eps  # (N,)
 
-                print(f"[RESIDUAL NODES] std min={std.min():.3e}, max={std.max():.3e}, mean={std.mean():.3e}")
                 small_nodes = int(np.sum(std < 1e-2))
-                print(f"[RESIDUAL NODES] nodes with std<1e-2: {small_nodes} out of {std.size}")
+                logger.debug(
+                    "Residual node std: min=%.3e, max=%.3e, mean=%.3e; %d/%d nodes below 1e-2",
+                    std.min(),
+                    std.max(),
+                    std.mean(),
+                    small_nodes,
+                    std.size,
+                )
 
                 std_safe = np.where(std < 1e-2, 1e-2, std)
 
@@ -925,8 +991,14 @@ def run_ml_rom_pipeline(cfg, log_time):
                 res_mu = mu.astype(np.float32)
                 res_std = std_safe.astype(np.float32)
 
-                print("[RESIDUAL] Residual corrector enabled: training GNN on residuals (per-node normalized)")
-                print(f"[NORM STATS] std_safe min={std_safe.min():.3e}, max={std_safe.max():.3e}, mean={std_safe.mean():.3e}")
+                detail(logger, "Residual corrector enabled with per-node normalization")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Safe residual std: min=%.3e, max=%.3e, mean=%.3e",
+                        std_safe.min(),
+                        std_safe.max(),
+                        std_safe.mean(),
+                    )
             else:
                 mu = float(R_tr.mean())
                 std = float(R_tr.std() + eps)
@@ -936,10 +1008,16 @@ def run_ml_rom_pipeline(cfg, log_time):
                 res_mu = np.array(mu, dtype=np.float32)
                 res_std = np.array(std, dtype=np.float32)
 
-                print("[RESIDUAL] Residual corrector enabled: training GNN on residuals (scalar normalized)")
+                detail(logger, "Residual corrector enabled with scalar normalization")
 
-            print(f"[NORM-CHECK] Train residuals mean/std {Y_train_n.mean():.3e}/{Y_train_n.std():.3e}")
-            print(f"[NORM-CHECK] Val residuals   mean/std {Y_val_n.mean():.3e}/{Y_val_n.std():.3e}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Normalized residual mean/std: training=%.3e/%.3e, validation=%.3e/%.3e",
+                    Y_train_n.mean(),
+                    Y_train_n.std(),
+                    Y_val_n.mean(),
+                    Y_val_n.std(),
+                )
 
     else:
         # No residual path: train directly on scalar-normalized target fields.
@@ -947,9 +1025,18 @@ def run_ml_rom_pipeline(cfg, log_time):
         res_mu = y_mu
         res_std = y_std
 
-        print(f"[NORM-CHECK] Train targets mean/std {Y_train_n.mean():.3e}/{Y_train_n.std():.3e}")
-        if Y_val_n is not None and isinstance(Y_val_n, np.ndarray) and Y_val_n.size:
-            print(f"[NORM-CHECK] Val targets   mean/std {Y_val_n.mean():.3e}/{Y_val_n.std():.3e}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Normalized training target mean/std: %.3e/%.3e",
+                Y_train_n.mean(),
+                Y_train_n.std(),
+            )
+            if Y_val_n is not None and isinstance(Y_val_n, np.ndarray) and Y_val_n.size:
+                logger.debug(
+                    "Normalized validation target mean/std: %.3e/%.3e",
+                    Y_val_n.mean(),
+                    Y_val_n.std(),
+                )
 
     # --- Ensure baseline exists if baseline-as-feature is requested, even without residuals. ---
     if baseline_model is None and use_baseline_as_feature:
@@ -1022,10 +1109,14 @@ def run_ml_rom_pipeline(cfg, log_time):
     if B_tr is not None:
         in_dim += 1  # baseline scalar field as extra node feature
 
-    print(
-        f"[CHECK] in_dim={in_dim}  X={X_node.shape[1]}  P={P_train_n.shape[1]}  "
-        f"t={(time_cfg.t_feat_dim if time_cfg.add_time else 0)}  "
-        f"baseline={'yes' if B_tr is not None else 'no'}"
+    detail(
+        logger,
+        "Training model dimensions: in_dim=%d, X=%d, P=%d, time=%d, baseline=%s",
+        in_dim,
+        X_node.shape[1],
+        P_train_n.shape[1],
+        time_cfg.t_feat_dim if time_cfg.add_time else 0,
+        "yes" if B_tr is not None else "no",
     )
 
     model = load_or_build_model(
@@ -1044,6 +1135,7 @@ def run_ml_rom_pipeline(cfg, log_time):
     )
 
     if not (bool(getattr(cfg, "skip_training", False)) and os.path.exists(model_path_pt)):
+        logger.info("Training Eulerian GNN model")
         with log_time("Training GNN (graph-first)"):
             Y_tr = Y_train_n
             Y_va = Y_val_n
@@ -1058,10 +1150,14 @@ def run_ml_rom_pipeline(cfg, log_time):
                 f"Node dim mismatch: Y_tr N={Y_tr.shape[1]} vs Y_va N={Y_va.shape[1]}"
             )
 
-            print(
-                f"[DBG] pipeline(normalized): Y_tr mean/std {Y_tr.mean():.3e}/{Y_tr.std():.3e} | "
-                f"Y_va mean/std {Y_va.mean():.3e}/{Y_va.std():.3e}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Pipeline normalized targets: training mean/std=%.3e/%.3e, validation mean/std=%.3e/%.3e",
+                    Y_tr.mean(),
+                    Y_tr.std(),
+                    Y_va.mean(),
+                    Y_va.std(),
+                )
 
             shuffle_seed = getattr(cfg, "shuffle_seed", None)
 
