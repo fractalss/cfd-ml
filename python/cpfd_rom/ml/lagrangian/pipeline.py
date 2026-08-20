@@ -9,7 +9,7 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
 
-from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
+from cpfd_rom.ml.lagrangian.data_loader import (
     compute_feature_stats,
     extract_scaffold_graphs,
     get_initial_template_graph,
@@ -17,17 +17,17 @@ from cpfd_rom.ml_rom.rom_lagrangian_ml.data_loader import (
     load_lagrangian_snapshots_as_graphs,
     sort_graphs_by_time,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.datasets import GraphSnapshotDataset
-from cpfd_rom.ml_rom.rom_lagrangian_ml.evaluation import write_lagrangian_rom_only
-from cpfd_rom.ml_rom.rom_lagrangian_ml.latent_regressor import (
+from cpfd_rom.ml.lagrangian.datasets import GraphSnapshotDataset
+from cpfd_rom.ml.lagrangian.evaluation import write_lagrangian_rom_only
+from cpfd_rom.ml.lagrangian.latent_regressor import (
     LatentRegressorMLP,
     build_latent_regression_dataloaders,
     train_latent_regressor_torch,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.model_pointnet_gnn import (
+from cpfd_rom.ml.lagrangian.model_pointnet_gnn import (
     PointNetGNNAutoencoder,
 )
-from cpfd_rom.ml_rom.rom_lagrangian_ml.training import train_pointnet_gnn_torch
+from cpfd_rom.ml.lagrangian.training import train_pointnet_gnn_torch
 from cpfd_rom.util.model_utils import setup_model_paths
 from cpfd_rom.util.output_utils import setup_output_dir
 from cpfd_rom.util.logging_config import detail

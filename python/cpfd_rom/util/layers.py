@@ -1,4 +1,4 @@
-# `ml_rom/utils/layers.py`
+# `ml/util/layers.py`
 
 from tensorflow.keras.layers import Layer
 import tensorflow as tf

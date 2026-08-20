@@ -1,4 +1,4 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/model_pointnet_gnn.py
+# cpfd_rom/ml/lagrangian/model_pointnet_gnn.py
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import global_max_pool
 
-from cpfd_rom.ml_rom.rom_lagrangian_ml.mlp_encoder import _make_mlp, EdgeConvBlock
+from cpfd_rom.ml.lagrangian.mlp_encoder import _make_mlp, EdgeConvBlock
 
 
 class FourierTimeEncoding(nn.Module):

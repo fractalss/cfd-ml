@@ -147,7 +147,7 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
         if rom_type == "ML" and field_type == "Eulerian":
             logger.info("Starting Eulerian ML ROM pipeline")
 
-            from cpfd_rom.ml_rom.rom_eulerian_ml.pipeline import (
+            from cpfd_rom.ml.eulerian.pipeline import (
                 run_ml_rom_pipeline,
             )
 
@@ -156,7 +156,7 @@ def run_from_config_path(config_path: str, infer_only: bool = False) -> int:
         elif rom_type == "ML" and field_type == "Lagrangian":
             logger.info("Starting Lagrangian ML ROM pipeline")
 
-            from cpfd_rom.ml_rom.rom_lagrangian_ml.pipeline import (
+            from cpfd_rom.ml.lagrangian.pipeline import (
                 run_lagrangian_ml_pipeline,
             )
 

@@ -1,4 +1,4 @@
-# cpfd_rom/ml_rom/rom_eulerian_ml/graph_build.py
+# cpfd_rom/ml/eulerian/graph_build.py
 
 from __future__ import annotations
 

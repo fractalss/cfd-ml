@@ -12,8 +12,8 @@ import pandas as pd
 import torch
 
 # Local project imports (gcn branch)
-from cpfd_rom.ml_rom.rom_eulerian_ml import graph_build
-from cpfd_rom.ml_rom.rom_eulerian_ml.model_gnn import build_node_features_xyz
+from cpfd_rom.ml.eulerian import graph_build
+from cpfd_rom.ml.eulerian.model_gnn import build_node_features_xyz
 
 __all__ = [
     "list_targets",

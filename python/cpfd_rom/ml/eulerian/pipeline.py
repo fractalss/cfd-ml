@@ -1,5 +1,5 @@
 # ===============================
-# File: cpfd_rom/ml_rom/rom_eulerian_ml/pipeline.py
+# File: cpfd_rom/ml/eulerian/pipeline.py
 # Purpose: Thin orchestrator that wires together modular Eulerian ML-ROM steps
 #          with parameter-specific transient ROM output directories and metadata.
 # ===============================

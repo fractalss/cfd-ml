@@ -1,4 +1,4 @@
-# cpfd_rom/ml_rom/rom_lagrangian_ml/inference.py
+# cpfd_rom/ml/lagrangian/inference.py
 
 from __future__ import annotations
 

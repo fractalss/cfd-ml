@@ -1,5 +1,5 @@
 # ===============================
-# File: cpfd_rom/ml_rom/rom_eulerian_ml/pipeline_refactored/pipeline_py_old
+# File: cpfd_rom/ml/eulerian/pipeline_refactored/pipeline_py_old
 # Purpose: Thin orchestrator that wires together modular steps
 # ===============================
 from __future__ import annotations
